@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.ipynb_checkpoints
+
+# Poetry
+.cache/
+dist/
+build/
+*.egg-info/
+
+# Jupyter
+notebooks/.ipynb_checkpoints/
+
+# VSCode or IDE
+.vscode/
+.idea/
+
+# Data
+*.csv
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+data/
+outputs/
+logs/
+runs/
+checkpoints/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.venv/
+venv/
