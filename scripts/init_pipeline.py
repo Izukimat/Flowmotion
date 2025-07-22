@@ -3,6 +3,7 @@
 Initialize the interpolation pipeline and scan available data
 """
 
+import os
 import argparse
 import sys
 from pathlib import Path
@@ -74,6 +75,10 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    args.base_dir = Path(os.path.expanduser(str(args.base_dir)))
+    args.processed_dir = Path(os.path.expanduser(str(args.processed_dir)))
+
     setup_logging(args.verbose)
     logger = logging.getLogger(__name__)
     

@@ -2,7 +2,7 @@
 # Full processing script for all HFR interpolation methods
 
 # Configuration
-BASE_DIR="/mnt/tcia_data/interpolated"
+BASE_DIR="$HOME/azureblob/4D-Lung-Interpolated"
 PROCESSED_DIR="/mnt/tcia_data/processed/4D-Lung-Cycles"
 SCRIPTS_DIR="."
 

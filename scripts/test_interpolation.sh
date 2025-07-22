@@ -2,7 +2,8 @@
 # Test script for small amount of interpolation across all methods
 
 # Configuration
-BASE_DIR="/mnt/tcia_data/interpolated"
+#BASE_DIR="/mnt/tcia_data/interpolated"
+BASE_DIR="$HOME/azureblob/4D-Lung-Interpolated"
 PROCESSED_DIR="/mnt/tcia_data/processed/4D-Lung-Cycles"
 SCRIPTS_DIR="scripts"
 

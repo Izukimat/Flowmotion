@@ -2,6 +2,7 @@
 Data processing module for various interpolation methods
 """
 
+import os
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -22,8 +23,8 @@ class DataProcessor:
     """Handles the actual interpolation processing for different methods"""
     
     def __init__(self, processed_data_dir: Path, output_base_dir: Path):
-        self.processed_data_dir = processed_data_dir
-        self.output_base_dir = output_base_dir
+        self.processed_data_dir = Path(os.path.expanduser(str(processed_data_dir)))
+        self.output_base_dir = Path(os.path.expanduser(str(output_base_dir)))
         
         # Method dispatch table
         self.interpolation_methods = {

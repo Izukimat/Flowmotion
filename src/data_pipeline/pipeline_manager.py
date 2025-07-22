@@ -2,6 +2,7 @@
 Main pipeline orchestrator for managing interpolation data preparation
 """
 
+import os
 import logging
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -36,8 +37,8 @@ class PipelineManager:
             processed_data_dir: Directory containing processed 4D-Lung-Cycles data
             manifest_file: Name of manifest file
         """
-        self.base_dir = Path(base_dir)
-        self.processed_data_dir = Path(processed_data_dir)
+        self.base_dir = Path(os.path.expanduser(str(base_dir)))
+        self.processed_data_dir = Path(os.path.expanduser(str(processed_data_dir)))
         
         # Create directory structure
         create_directory_structure(self.base_dir)
