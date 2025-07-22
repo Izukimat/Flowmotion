@@ -351,6 +351,27 @@ class DataProcessor:
         
         target_frames = []
         
+        def normalize_frames_consistently(frame1, frame2):
+            """Normalize both frames using the same scale"""
+            frame1 = np.asarray(frame1, dtype=np.float64)
+            frame2 = np.asarray(frame2, dtype=np.float64)
+            
+            global_min = min(frame1.min(), frame2.min())
+            global_max = max(frame1.max(), frame2.max())
+            
+            if global_max <= global_min:
+                return (np.full_like(frame1, 128, dtype=np.uint8), 
+                       np.full_like(frame2, 128, dtype=np.uint8),
+                       global_min, global_max)
+            
+            frame1_norm = (frame1 - global_min) / (global_max - global_min) * 255
+            frame2_norm = (frame2 - global_min) / (global_max - global_min) * 255
+            
+            frame1_uint8 = np.clip(frame1_norm, 0, 255).astype(np.uint8)
+            frame2_uint8 = np.clip(frame2_norm, 0, 255).astype(np.uint8)
+            
+            return frame1_uint8, frame2_uint8, global_min, global_max
+        
         # Process each target phase
         for target_phase in experiment.target_phases:
             # Find nearest two input phases
@@ -374,42 +395,69 @@ class DataProcessor:
                 target_frames.append(phase_data[lower_phase])
                 continue
             
-            # Convert to uint8 for optical flow
-            frame1 = (phase_data[lower_phase] * 255).astype(np.uint8)
-            frame2 = (phase_data[upper_phase] * 255).astype(np.uint8)
+            try:
+                # Normalize frames consistently
+                frame1, frame2, global_min, global_max = normalize_frames_consistently(
+                    phase_data[lower_phase], phase_data[upper_phase])
+                
+                # Check for sufficient contrast
+                if (np.std(frame1) < 1.0 or np.std(frame2) < 1.0):
+                    logger.warning(f"Low contrast frames for phases {lower_phase}-{upper_phase}, using linear interpolation")
+                    alpha = (target_phase - lower_phase) / (upper_phase - lower_phase)
+                    interpolated = (1 - alpha) * phase_data[lower_phase] + alpha * phase_data[upper_phase]
+                    target_frames.append(interpolated)
+                    continue
+                
+                # Calculate optical flow
+                flow = cv2.calcOpticalFlowFarneback(
+                    frame1, frame2, None,
+                    pyr_scale=0.5, levels=3, winsize=15,
+                    iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+                )
+                
+                # Check if optical flow succeeded
+                if flow is None or np.any(np.isnan(flow)) or np.any(np.isinf(flow)):
+                    logger.warning(f"Optical flow failed for phases {lower_phase}-{upper_phase}, using linear interpolation")
+                    alpha = (target_phase - lower_phase) / (upper_phase - lower_phase)
+                    interpolated = (1 - alpha) * phase_data[lower_phase] + alpha * phase_data[upper_phase]
+                    target_frames.append(interpolated)
+                    continue
+                
+                # Interpolation factor
+                alpha = (target_phase - lower_phase) / (upper_phase - lower_phase)
+                
+                # Apply weighted flow
+                h, w = frame1.shape
+                flow_scaled = flow * alpha
+                
+                # Create mesh grid
+                row_coords, col_coords = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+                
+                # Apply flow displacement
+                displaced_rows = row_coords + flow_scaled[..., 1]
+                displaced_cols = col_coords + flow_scaled[..., 0]
+                
+                # Remap the image
+                interpolated_uint8 = cv2.remap(
+                    frame1.astype(np.float32),
+                    displaced_cols.astype(np.float32),
+                    displaced_rows.astype(np.float32),
+                    cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT
+                )
+                
+                # Convert back to original scale using consistent global scale
+                interpolated = interpolated_uint8 / 255.0 * (global_max - global_min) + global_min
+                interpolated = np.clip(interpolated, global_min, global_max)
+                
+                target_frames.append(interpolated)
             
-            # Calculate optical flow
-            flow = cv2.calcOpticalFlowFarneback(
-                frame1, frame2, None,
-                pyr_scale=0.5, levels=3, winsize=15,
-                iterations=3, poly_n=5, poly_sigma=1.2, flags=0
-            )
-            
-            # Interpolation factor
-            alpha = (target_phase - lower_phase) / (upper_phase - lower_phase)
-            
-            # Apply weighted flow
-            h, w = frame1.shape
-            flow_scaled = flow * alpha
-            
-            # Create mesh grid
-            row_coords, col_coords = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
-            
-            # Apply flow displacement
-            displaced_rows = row_coords + flow_scaled[..., 1]
-            displaced_cols = col_coords + flow_scaled[..., 0]
-            
-            # Remap the image
-            interpolated = cv2.remap(
-                frame1.astype(np.float32),
-                displaced_cols.astype(np.float32),
-                displaced_rows.astype(np.float32),
-                cv2.INTER_LINEAR
-            )
-            
-            # Convert back to original scale
-            interpolated = interpolated / 255.0 * phase_data[lower_phase].max()
-            target_frames.append(interpolated)
+            except Exception as e:
+                logger.error(f"Optical flow failed for phases {lower_phase}-{upper_phase}: {e}. Using linear interpolation.")
+                # Fall back to linear interpolation
+                alpha = (target_phase - lower_phase) / (upper_phase - lower_phase)
+                interpolated = (1 - alpha) * phase_data[lower_phase] + alpha * phase_data[upper_phase]
+                target_frames.append(interpolated)
         
         target_frames = np.stack(target_frames)
         
@@ -441,63 +489,122 @@ class DataProcessor:
                 input_frames.append(start_frame)
                 all_interpolated_frames.append(start_frame)
             
-            # Convert to uint8 for optical flow
-            frame1_uint8 = (start_frame * 255 / start_frame.max()).astype(np.uint8)
-            frame2_uint8 = (end_frame * 255 / end_frame.max()).astype(np.uint8)
+            # Robust normalization to uint8 for optical flow
+            def normalize_frames_consistently(frame1, frame2):
+                """
+                Normalize both frames using the same scale to preserve relative intensities
+                This is crucial for optical flow to work correctly
+                """
+                frame1 = np.asarray(frame1, dtype=np.float64)
+                frame2 = np.asarray(frame2, dtype=np.float64)
+                
+                # Find global min/max across both frames
+                global_min = min(frame1.min(), frame2.min())
+                global_max = max(frame1.max(), frame2.max())
+                
+                # Handle edge cases
+                if global_max <= global_min:
+                    logger.warning(f"Frames have no dynamic range (min={global_min}, max={global_max})")
+                    # Return mid-gray frames
+                    return (np.full_like(frame1, 128, dtype=np.uint8), 
+                           np.full_like(frame2, 128, dtype=np.uint8),
+                           global_min, global_max)
+                
+                # Normalize both frames using the same scale
+                frame1_norm = (frame1 - global_min) / (global_max - global_min) * 255
+                frame2_norm = (frame2 - global_min) / (global_max - global_min) * 255
+                
+                # Ensure valid range and convert to uint8
+                frame1_uint8 = np.clip(frame1_norm, 0, 255).astype(np.uint8)
+                frame2_uint8 = np.clip(frame2_norm, 0, 255).astype(np.uint8)
+                
+                return frame1_uint8, frame2_uint8, global_min, global_max
             
-            # Calculate optical flow between consecutive phases
-            if flow_algorithm == 'farneback':
-                flow = cv2.calcOpticalFlowFarneback(
-                    frame1_uint8, frame2_uint8, None,
-                    pyr_scale=0.5, levels=3, winsize=15,
-                    iterations=3, poly_n=5, poly_sigma=1.2, flags=0
-                )
-            else:
-                # Could add other algorithms here (e.g., DIS, DeepFlow)
-                flow = cv2.calcOpticalFlowFarneback(
-                    frame1_uint8, frame2_uint8, None,
-                    pyr_scale=0.5, levels=3, winsize=15,
-                    iterations=3, poly_n=5, poly_sigma=1.2, flags=0
-                )
+            try:
+                frame1_uint8, frame2_uint8, global_min, global_max = normalize_frames_consistently(start_frame, end_frame)
+                
+                # Check if frames are valid for optical flow (not completely uniform)
+                if (np.std(frame1_uint8) < 1.0 or np.std(frame2_uint8) < 1.0):
+                    logger.warning(f"Low contrast frames detected for phases {start_phase}-{end_phase}, using linear interpolation")
+                    # Fall back to linear interpolation for this interval
+                    for j in range(1, frames_per_interval + 1):
+                        alpha = j / (frames_per_interval + 1)
+                        interpolated = (1 - alpha) * start_frame + alpha * end_frame
+                        all_interpolated_frames.append(interpolated)
+                    continue
+                
+                # Calculate optical flow between consecutive phases
+                if flow_algorithm == 'farneback':
+                    flow = cv2.calcOpticalFlowFarneback(
+                        frame1_uint8, frame2_uint8, None,
+                        pyr_scale=0.5, levels=3, winsize=15,
+                        iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+                    )
+                else:
+                    # Fallback to Farneback
+                    flow = cv2.calcOpticalFlowFarneback(
+                        frame1_uint8, frame2_uint8, None,
+                        pyr_scale=0.5, levels=3, winsize=15,
+                        iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+                    )
+                
+                # Check if optical flow calculation succeeded
+                if flow is None or np.any(np.isnan(flow)) or np.any(np.isinf(flow)):
+                    logger.warning(f"Optical flow failed for phases {start_phase}-{end_phase}, using linear interpolation")
+                    # Fall back to linear interpolation
+                    for j in range(1, frames_per_interval + 1):
+                        alpha = j / (frames_per_interval + 1)
+                        interpolated = (1 - alpha) * start_frame + alpha * end_frame
+                        all_interpolated_frames.append(interpolated)
+                    continue
+                
+                # Create mesh grid for remapping
+                h, w = start_frame.shape
+                row_coords, col_coords = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+                
+                # Interpolate frames using optical flow
+                for j in range(1, frames_per_interval + 1):
+                    alpha = j / (frames_per_interval + 1)
+                    
+                    # Scale flow by interpolation factor
+                    flow_scaled = flow * alpha
+                    
+                    # Apply flow displacement
+                    displaced_rows = row_coords + flow_scaled[..., 1]
+                    displaced_cols = col_coords + flow_scaled[..., 0]
+                    
+                    # Remap the image using the flow
+                    interpolated_uint8 = cv2.remap(
+                        frame1_uint8.astype(np.float32),
+                        displaced_cols.astype(np.float32),
+                        displaced_rows.astype(np.float32),
+                        cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_REFLECT
+                    )
+                    
+                    # Blend with linear interpolation for stability
+                    # (pure optical flow can sometimes create artifacts)
+                    linear_interp = (1 - alpha) * frame1_uint8.astype(np.float32) + alpha * frame2_uint8.astype(np.float32)
+                    
+                    # Weighted combination (more trust in optical flow for small displacements)
+                    flow_weight = 0.8  # Can be tuned
+                    interpolated_uint8 = flow_weight * interpolated_uint8 + (1 - flow_weight) * linear_interp
+                    
+                    # Convert back to original scale using the consistent global scale
+                    interpolated = interpolated_uint8 / 255.0 * (global_max - global_min) + global_min
+                    
+                    # Ensure the result is in a reasonable range
+                    interpolated = np.clip(interpolated, global_min, global_max)
+                    
+                    all_interpolated_frames.append(interpolated)
             
-            # Create mesh grid for remapping
-            h, w = start_frame.shape
-            row_coords, col_coords = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
-            
-            # Interpolate frames using optical flow
-            for j in range(1, frames_per_interval + 1):
-                alpha = j / (frames_per_interval + 1)
-                
-                # Scale flow by interpolation factor
-                flow_scaled = flow * alpha
-                
-                # Apply flow displacement
-                displaced_rows = row_coords + flow_scaled[..., 1]
-                displaced_cols = col_coords + flow_scaled[..., 0]
-                
-                # Remap the image using the flow
-                interpolated_uint8 = cv2.remap(
-                    frame1_uint8.astype(np.float32),
-                    displaced_cols.astype(np.float32),
-                    displaced_rows.astype(np.float32),
-                    cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_REFLECT
-                )
-                
-                # Blend with linear interpolation for stability
-                # (pure optical flow can sometimes create artifacts)
-                linear_interp = (1 - alpha) * frame1_uint8 + alpha * frame2_uint8
-                
-                # Weighted combination (more trust in optical flow for small displacements)
-                flow_weight = 0.8  # Can be tuned
-                interpolated_uint8 = flow_weight * interpolated_uint8 + (1 - flow_weight) * linear_interp
-                
-                # Convert back to original scale
-                # Preserve the intensity range of the original data
-                interpolated = interpolated_uint8 / 255.0
-                interpolated = interpolated * (start_frame.max() - start_frame.min()) + start_frame.min()
-                
-                all_interpolated_frames.append(interpolated)
+            except Exception as e:
+                logger.error(f"Optical flow failed for phases {start_phase}-{end_phase}: {e}. Using linear interpolation.")
+                # Fall back to linear interpolation for this entire interval
+                for j in range(1, frames_per_interval + 1):
+                    alpha = j / (frames_per_interval + 1)
+                    interpolated = (1 - alpha) * start_frame + alpha * end_frame
+                    all_interpolated_frames.append(interpolated)
             
             # Add the end frame
             input_frames.append(end_frame)
