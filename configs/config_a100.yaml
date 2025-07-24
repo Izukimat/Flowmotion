@@ -1,0 +1,59 @@
+# config_a100.yaml - Full configuration for A100 GPUs
+model:
+  # VAE settings
+  vae_base_model: 'medvae_4_1_3d'
+  latent_channels: 16  # More expressive
+  vae_temporal_weight: 0.1
+  freeze_vae_after: 5000
+  
+  # DiT settings - full size
+  dit_config:
+    latent_channels: 16
+    latent_size: [5, 16, 16]
+    hidden_dim: 768
+    depth: 24
+    num_heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.1
+    use_rope: true
+  
+  # Flow matching settings
+  flow_matching_config:
+    num_sampling_steps: 50
+    sigma_min: 1.0e-5
+    use_ode_solver: 'euler'
+    time_sampling: 'logit_normal'  # More sophisticated
+    loss_weighting: 'velocity'
+    interpolation_method: 'optimal_transport'
+
+training:
+  # Optimization
+  vae_lr: 1.0e-4
+  dit_lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  
+  # Loss weights
+  velocity_weight: 1.0
+  flf_weight: 0.1
+  vae_recon_weight: 1.0
+  vae_kl_weight: 0.01
+  vae_temporal_weight: 0.1
+  
+  # Training schedule
+  num_epochs: 100
+  val_freq: 5
+  save_freq: 10
+  
+  # Batch settings for A100 (40GB)
+  batch_size: 4  # Per GPU
+  mixed_precision: true
+  gradient_checkpointing: false  # Not needed with more memory
+
+data:
+  # Data settings
+  num_frames: 40  # Full sequence
+  target_size: [128, 128, 40]
+  slice_mode: 'three_slices'
+  slice_indices: [10, 25, 40]
+  intensity_window: [-1000, 500]

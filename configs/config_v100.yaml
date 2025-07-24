@@ -1,0 +1,61 @@
+# config_v100.yaml - Memory-efficient configuration for V100 GPUs
+model:
+  # VAE settings
+  vae_base_model: 'medvae_4_1_3d'  # 4x compression per dimension
+  latent_channels: 8  # Balanced expressiveness vs memory
+  vae_temporal_weight: 0.1
+  freeze_vae_after: 5000
+  
+  # DiT settings - scaled down for V100
+  dit_config:
+    latent_channels: 8
+    latent_size: [5, 16, 16]  # After 8x compression of 40x128x128
+    hidden_dim: 512  # Reduced from 768
+    depth: 12  # Reduced from 24
+    num_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    use_rope: true
+  
+  # Flow matching settings
+  flow_matching_config:
+    num_sampling_steps: 50
+    sigma_min: 1.0e-5
+    use_ode_solver: 'euler'
+    time_sampling: 'uniform'
+    loss_weighting: 'uniform'
+    interpolation_method: 'optimal_transport'
+
+training:
+  # Optimization
+  vae_lr: 1.0e-4
+  dit_lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  
+  # Loss weights
+  velocity_weight: 1.0
+  flf_weight: 0.1
+  vae_recon_weight: 1.0
+  vae_kl_weight: 0.01
+  vae_temporal_weight: 0.1
+  
+  # Training schedule
+  num_epochs: 100
+  val_freq: 5
+  save_freq: 10
+  
+  # Batch settings for V100 (16GB)
+  batch_size: 1  # Per GPU
+  gradient_accumulation_steps: 4  # Effective batch size of 4
+  mixed_precision: true
+  gradient_checkpointing: true
+
+data:
+  # Data settings
+  num_frames: 20  # Start with fewer frames
+  target_size: [128, 128, 20]
+  slice_mode: 'three_slices'  # Use strategic slices
+  slice_indices: [10, 25, 40]  # Apex, middle, base
+  intensity_window: [-1000, 500]  # Lung window
+

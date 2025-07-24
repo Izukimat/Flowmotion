@@ -27,7 +27,6 @@ import pandas as pd
 import nibabel as nib
 from tqdm import tqdm
 import wandb
-from einops import rearrange
 import yaml
 
 # Import our modules (adjust path as needed)

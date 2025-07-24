@@ -164,90 +164,389 @@ def generate_sequence(
     Returns:
         Generated sequence [B, 1, T, H, W]
     """
-    # (1) move to GPU and add depth dimension
-    first_frame = first_frame.to(device).unsqueeze(2)   # [B,1,1,H,W]
-    last_frame  = last_frame .to(device).unsqueeze(2)   # [B,1,1,H,W]
-
-    # (2) encode to latent
-    with torch.no_grad():
-        first_lat = model.encode_frames(first_frame)    # [B,C,1/8,H/8,W/8]
-        last_lat  = model.encode_frames(last_frame )
-
-    # (3) override sampler settings if caller asked
-    fm_cfg = model.flow_matching.config
-    fm_cfg.num_sampling_steps = num_inference_steps
-
-    latent_video = model.flow_matching.sample(
-        first_lat, last_lat,
-        num_frames      = num_frames,
-        guidance_scale  = guidance_scale,
-        progress_bar    = False,
-    )                                   # [B,C,T/8,H/8,W/8]
-
-    # (4) decode to pixel space
-    video = model.decode_frames(latent_video)           # [B,1,T,H,W]
-    return video
+    first_frame = first_frame.to(device)
+    last_frame = last_frame.to(device)
+    
+    # Update flow matching config
+    model.flow_matching.config.num_sampling_steps = num_inference_steps
+    
+    # Generate
+    generated = model.generate(
+        first_frame,
+        last_frame,
+        num_frames=num_frames,
+        guidance_scale=guidance_scale,
+        decode=True  # Decode to pixel space
+    )
+    
+    return generated
 
 
-# ============= CLI entry point  =============
+def save_as_nifti(
+    volume: np.ndarray,
+    affine: np.ndarray,
+    output_path: str,
+    time_axis: bool = True
+):
+    """Save volume as NIfTI file"""
+    if time_axis:
+        # Reorder from [C, T, H, W] to [H, W, T, C] for NIfTI
+        if volume.ndim == 4:
+            volume = np.transpose(volume, (2, 3, 1, 0))
+        elif volume.ndim == 3:
+            volume = np.transpose(volume, (1, 2, 0))
+    
+    nii = nib.Nifti1Image(volume, affine)
+    nib.save(nii, output_path)
+    logging.info(f"Saved to {output_path}")
+
+
+def save_as_video(
+    volume: np.ndarray,
+    output_path: str,
+    fps: int = 10,
+    quality: int = 95
+):
+    """Save volume as MP4 video"""
+    import imageio
+    
+    # Normalize to [0, 255]
+    volume = ((volume + 1) * 127.5).clip(0, 255).astype(np.uint8)
+    
+    # If single channel, repeat for RGB
+    if volume.shape[0] == 1:
+        volume = np.repeat(volume, 3, axis=0)
+    
+    # Transpose to [T, H, W, C]
+    volume = np.transpose(volume, (1, 2, 3, 0))
+    
+    # Write video
+    imageio.mimwrite(output_path, volume, fps=fps, quality=quality)
+    logging.info(f"Saved video to {output_path}")
+
+
+def create_comparison_figure(
+    first_frame: np.ndarray,
+    last_frame: np.ndarray,
+    generated: np.ndarray,
+    output_path: str
+):
+    """Create comparison figure showing first, middle, last frames"""
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+    
+    # Original first and last
+    axes[0, 0].imshow(first_frame.squeeze(), cmap='gray')
+    axes[0, 0].set_title('First Frame (Input)')
+    axes[0, 0].axis('off')
+    
+    axes[0, 2].imshow(last_frame.squeeze(), cmap='gray')
+    axes[0, 2].set_title('Last Frame (Input)')
+    axes[0, 2].axis('off')
+    
+    # Generated frames
+    T = generated.shape[1]
+    mid_idx = T // 2
+    
+    axes[0, 1].imshow(generated[0, mid_idx], cmap='gray')
+    axes[0, 1].set_title(f'Generated Frame {mid_idx}')
+    axes[0, 1].axis('off')
+    
+    # Show a few more generated frames
+    for i, idx in enumerate([T//4, T//2, 3*T//4]):
+        axes[1, i].imshow(generated[0, idx], cmap='gray')
+        axes[1, i].set_title(f'Generated Frame {idx}')
+        axes[1, i].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logging.info(f"Saved comparison figure to {output_path}")
+
+
+# ============= Batch Processing =============
+
+def process_batch(
+    model: LungCTFLF2V,
+    batch: Dict,
+    config: Dict,
+    output_dir: Path,
+    save_formats: List[str] = ['nifti', 'video', 'figure']
+) -> Dict[str, float]:
+    """Process a batch of samples"""
+    device = next(model.parameters()).device
+    
+    # Generate sequences
+    start_time = time.time()
+    
+    generated = generate_sequence(
+        model,
+        batch['first_frame'],
+        batch['last_frame'],
+        num_frames=config.get('num_frames', 40),
+        guidance_scale=config.get('guidance_scale', 1.0),
+        num_inference_steps=config.get('num_inference_steps', 50),
+        device=device
+    )
+    
+    generation_time = time.time() - start_time
+    
+    # Process each sample in batch
+    batch_size = generated.shape[0]
+    
+    for i in range(batch_size):
+        # Extract paths for naming
+        first_path = Path(batch['first_path'][i])
+        last_path = Path(batch['last_path'][i])
+        
+        sample_name = f"{first_path.stem}_to_{last_path.stem}"
+        sample_dir = output_dir / sample_name
+        sample_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Get data
+        first_np = batch['first_frame'][i].cpu().numpy()
+        last_np = batch['last_frame'][i].cpu().numpy()
+        generated_np = generated[i].cpu().numpy()
+        
+        # Save in different formats
+        if 'nifti' in save_formats:
+            save_as_nifti(
+                generated_np,
+                batch['first_affine'][i].numpy(),
+                str(sample_dir / 'generated_sequence.nii.gz'),
+                time_axis=True
+            )
+        
+        if 'video' in save_formats:
+            save_as_video(
+                generated_np,
+                str(sample_dir / 'generated_sequence.mp4'),
+                fps=config.get('video_fps', 10)
+            )
+        
+        if 'figure' in save_formats:
+            create_comparison_figure(
+                first_np,
+                last_np,
+                generated_np,
+                str(sample_dir / 'comparison.png')
+            )
+        
+        # Save individual frames if requested
+        if config.get('save_individual_frames', False):
+            frames_dir = sample_dir / 'frames'
+            frames_dir.mkdir(exist_ok=True)
+            
+            for t in range(generated_np.shape[1]):
+                frame = generated_np[0, t]
+                frame_normalized = ((frame + 1) * 127.5).clip(0, 255).astype(np.uint8)
+                cv2.imwrite(
+                    str(frames_dir / f'frame_{t:03d}.png'),
+                    frame_normalized
+                )
+    
+    return {
+        'generation_time': generation_time,
+        'samples_processed': batch_size,
+        'time_per_sample': generation_time / batch_size
+    }
+
+
+# ============= Evaluation Metrics =============
+
+def compute_metrics(
+    generated: torch.Tensor,
+    first_frame: torch.Tensor,
+    last_frame: torch.Tensor
+) -> Dict[str, float]:
+    """Compute evaluation metrics"""
+    metrics = {}
+    
+    # Check first/last frame preservation
+    first_error = torch.mean((generated[:, :, 0] - first_frame.squeeze(2))**2).item()
+    last_error = torch.mean((generated[:, :, -1] - last_frame.squeeze(2))**2).item()
+    
+    metrics['first_frame_mse'] = first_error
+    metrics['last_frame_mse'] = last_error
+    
+    # Temporal smoothness (first-order differences)
+    temporal_diff = generated[:, :, 1:] - generated[:, :, :-1]
+    metrics['temporal_smoothness'] = torch.mean(temporal_diff**2).item()
+    
+    # Acceleration (second-order differences)
+    if generated.shape[2] > 2:
+        acceleration = temporal_diff[:, :, 1:] - temporal_diff[:, :, :-1]
+        metrics['temporal_acceleration'] = torch.mean(acceleration**2).item()
+    
+    return metrics
+
+
+# ============= Main Inference Function =============
 
 def main():
-    parser = argparse.ArgumentParser(description="FLF2V inference")
-    parser.add_argument("--checkpoint",   required=True)
-    parser.add_argument("--pairs-file",   required=True,
-                        help="txt|csv: first_path,last_path per line")
-    parser.add_argument("--output-dir",   default="./outputs_infer")
-    parser.add_argument("--num-frames",   type=int, default=40)
-    parser.add_argument("--steps",        type=int, default=50)
-    parser.add_argument("--guidance",     type=float, default=1.0)
-    parser.add_argument("--gpu",          type=int, default=0)
+    parser = argparse.ArgumentParser(description='Generate lung CT sequences with FLF2V')
+    
+    # Required arguments
+    parser.add_argument('--checkpoint', type=str, required=True, help='Model checkpoint path')
+    parser.add_argument('--output-dir', type=str, required=True, help='Output directory')
+    
+    # Input specification (multiple options)
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('--input-csv', type=str, help='CSV file with first/last frame paths')
+    input_group.add_argument('--first-frame', type=str, help='Single first frame path')
+    parser.add_argument('--last-frame', type=str, help='Single last frame path (required with --first-frame)')
+    input_group.add_argument('--input-dir', type=str, help='Directory with paired frames')
+    
+    # Generation parameters
+    parser.add_argument('--num-frames', type=int, default=40, help='Number of frames to generate')
+    parser.add_argument('--guidance-scale', type=float, default=1.0, help='Classifier-free guidance scale')
+    parser.add_argument('--num-inference-steps', type=int, default=50, help='Number of denoising steps')
+    parser.add_argument('--batch-size', type=int, default=1, help='Batch size for inference')
+    
+    # Output options
+    parser.add_argument('--save-formats', nargs='+', default=['nifti', 'video', 'figure'],
+                        choices=['nifti', 'video', 'figure'], help='Output formats')
+    parser.add_argument('--video-fps', type=int, default=10, help='FPS for video output')
+    parser.add_argument('--save-individual-frames', action='store_true', help='Save individual frames as PNG')
+    
+    # Other options
+    parser.add_argument('--device', type=str, default='cuda', help='Device to use')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--verbose', action='store_true', help='Verbose logging')
+    
     args = parser.parse_args()
-
-    device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # -------- 1. model ------------------------------------------------------
-    model, _cfg = load_model(args.checkpoint, device)
-
-    # -------- 2. build dataset / loader ------------------------------------
-    first_paths, last_paths = [], []
-    with open(args.pairs_file, "r") as f:
-        for line in f:
-            fp, lp = line.strip().split(",")
-            first_paths.append(fp)
-            last_paths .append(lp)
-
-    ds = InferenceDataset(first_paths, last_paths,
-                          target_size = tuple(_cfg["data"]["target_size"][:2]),
-                          intensity_window = tuple(_cfg["data"]["intensity_window"]))
-    loader = DataLoader(ds, batch_size=4, shuffle=False)
-
-    # -------- 3. loop -------------------------------------------------------
-    model.eval()
-    for i, batch in enumerate(tqdm(loader, desc="Generate")):
-        vid = generate_sequence(
+    
+    # Validate arguments
+    if args.first_frame and not args.last_frame:
+        parser.error("--last-frame required when using --first-frame")
+    
+    # Setup logging
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    # Set random seed
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load model
+    model, config = load_model(args.checkpoint, args.device)
+    
+    # Prepare inference config
+    inference_config = {
+        'num_frames': args.num_frames,
+        'guidance_scale': args.guidance_scale,
+        'num_inference_steps': args.num_inference_steps,
+        'video_fps': args.video_fps,
+        'save_individual_frames': args.save_individual_frames
+    }
+    
+    # Save inference config
+    with open(output_dir / 'inference_config.yaml', 'w') as f:
+        yaml.dump(inference_config, f)
+    
+    # Prepare input data
+    if args.input_csv:
+        # Load from CSV
+        df = pd.read_csv(args.input_csv)
+        first_frames = df['first_frame'].tolist()
+        last_frames = df['last_frame'].tolist()
+        
+    elif args.first_frame:
+        # Single pair
+        first_frames = [args.first_frame]
+        last_frames = [args.last_frame]
+        
+    elif args.input_dir:
+        # Load from directory (assumes naming convention)
+        input_dir = Path(args.input_dir)
+        first_frames = sorted(input_dir.glob('*_first.nii.gz'))
+        last_frames = sorted(input_dir.glob('*_last.nii.gz'))
+        
+        # Match pairs
+        first_frames = [str(f) for f in first_frames]
+        last_frames = [str(f) for f in last_frames]
+    
+    # Create dataset
+    dataset = InferenceDataset(
+        first_frames,
+        last_frames,
+        target_size=tuple(config['data']['target_size'][:2]),
+        intensity_window=tuple(config['data'].get('intensity_window', (-1000, 500)))
+    )
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,  # NIfTI loading doesn't parallelize well
+        pin_memory=True
+    )
+    
+    # Process all samples
+    total_metrics = []
+    total_time = 0
+    
+    logging.info(f"Processing {len(dataset)} sample pairs...")
+    
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating sequences")):
+        # Process batch
+        timing = process_batch(
             model,
-            batch["first_frame"],
-            batch["last_frame"],
-            num_frames          = args.num_frames,
-            guidance_scale      = args.guidance,
-            num_inference_steps = args.steps,
-            device              = device,
-        )                                              # [B,1,T,H,W]
-
-        vid = vid.cpu().numpy()
-
-        # save each sample
-        for j in range(vid.shape[0]):
-            out_name = (
-                Path(batch["first_path"][j]).stem + "_to_" +
-                Path(batch["last_path"][j]).stem + ".nii.gz"
-            )
-            affine = batch["first_affine"][j].numpy()
-            nii = nib.Nifti1Image(vid[j,0].transpose(1,2,3,0), affine)
-            nib.save(nii, Path(args.output_dir) / out_name)
-
-    print(f"Done. Saved NIfTI sequences to {args.output_dir}")
+            batch,
+            inference_config,
+            output_dir,
+            save_formats=args.save_formats
+        )
+        
+        total_time += timing['generation_time']
+        
+        # Compute metrics if requested
+        if args.verbose:
+            with torch.no_grad():
+                generated = generate_sequence(
+                    model,
+                    batch['first_frame'],
+                    batch['last_frame'],
+                    num_frames=args.num_frames,
+                    guidance_scale=args.guidance_scale,
+                    num_inference_steps=args.num_inference_steps,
+                    device=args.device
+                )
+                
+                metrics = compute_metrics(
+                    generated,
+                    batch['first_frame'],
+                    batch['last_frame']
+                )
+                total_metrics.append(metrics)
+    
+    # Summary statistics
+    logging.info(f"\nInference complete!")
+    logging.info(f"Total time: {total_time:.2f}s")
+    logging.info(f"Average time per sample: {total_time/len(dataset):.2f}s")
+    logging.info(f"Output saved to: {output_dir}")
+    
+    # Save metrics if computed
+    if total_metrics:
+        avg_metrics = {
+            k: np.mean([m[k] for m in total_metrics])
+            for k in total_metrics[0].keys()
+        }
+        
+        with open(output_dir / 'metrics.json', 'w') as f:
+            json.dump({
+                'average_metrics': avg_metrics,
+                'all_metrics': total_metrics
+            }, f, indent=2)
+        
+        logging.info("\nAverage metrics:")
+        for k, v in avg_metrics.items():
+            logging.info(f"  {k}: {v:.6f}")
 
 
 if __name__ == "__main__":
