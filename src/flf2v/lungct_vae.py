@@ -19,6 +19,11 @@ class LungCTVAE(nn.Module):
     - Increased latent channels (8-16 instead of 1)
     - Temporal consistency regularization
     - Tanh output scaling for zero-mean unit-var latents
+    
+    IMPORTANT: Channel expansion is applied only to the sampled z, not mu/logvar.
+    The KL divergence is computed on the original 1-channel distribution from MedVAE.
+    This preserves the probabilistic interpretation while allowing multi-channel latents
+    for the flow matching model.
     """
     
     def __init__(
@@ -44,11 +49,15 @@ class LungCTVAE(nn.Module):
         
         # Adapt for increased channels: add projection layers
         if latent_channels != 1:
-            # Project from 1 channel to N channels after encoding
+            # Two options for channel expansion:
+            # Option 1: Learned projection (current implementation)
             self.channel_expansion = nn.Conv3d(
                 1, latent_channels, 
                 kernel_size=1, stride=1, padding=0
             )
+            
+            # Option 2: Simple repetition (uncomment to use)
+            # self.channel_expansion = lambda x: x.repeat(1, latent_channels, 1, 1, 1)
             
             # Project from N channels back to 1 before decoding
             self.channel_reduction = nn.Conv3d(
@@ -57,8 +66,9 @@ class LungCTVAE(nn.Module):
             )
             
             # Initialize with identity-like mapping
-            nn.init.xavier_uniform_(self.channel_expansion.weight, gain=1.0)
-            nn.init.zeros_(self.channel_expansion.bias)
+            if isinstance(self.channel_expansion, nn.Conv3d):
+                nn.init.xavier_uniform_(self.channel_expansion.weight, gain=1.0)
+                nn.init.zeros_(self.channel_expansion.bias)
             nn.init.xavier_uniform_(self.channel_reduction.weight, gain=1.0)
             nn.init.zeros_(self.channel_reduction.bias)
         
@@ -78,7 +88,7 @@ class LungCTVAE(nn.Module):
         Args:
             x: Input tensor [B, 1, D, H, W] in range [-1, 1]
         Returns:
-            dict with 'latent', 'mu', 'logvar'
+            dict with 'latent', 'mu', 'logvar', 'mu_expanded', 'logvar_expanded'
         """
         # Use base VAE encoder
         posterior = self.base_vae.encode(x)
@@ -89,11 +99,15 @@ class LungCTVAE(nn.Module):
         eps = torch.randn_like(std)
         z = mu + eps * std
         
+        # Store original mu/logvar for KL computation
+        mu_original = mu
+        logvar_original = logvar
+        
         # Expand channels if needed
         if self.latent_channels != 1:
             z = self.channel_expansion(z)
-            mu = self.channel_expansion(mu)
-            logvar = self.channel_expansion(logvar)
+            # For flow matching, we only need the expanded z
+            # We do NOT expand mu/logvar as that breaks the probabilistic interpretation
         
         # Apply tanh scaling for zero-mean unit-var
         if self.use_tanh_scaling:
@@ -101,8 +115,9 @@ class LungCTVAE(nn.Module):
         
         return {
             'latent': z,
-            'mu': mu,
-            'logvar': logvar
+            'mu': mu_original,  # Keep original for KL
+            'logvar': logvar_original,  # Keep original for KL
+            'z_pre_tanh': z if not self.use_tanh_scaling else None
         }
     
     def decode(self, z: torch.Tensor) -> torch.Tensor:
@@ -146,13 +161,14 @@ class LungCTVAE(nn.Module):
         # Compute losses
         recon_loss = F.mse_loss(x_recon, x, reduction='mean')
         
-        # KL divergence
+        # KL divergence - use original 1-channel mu/logvar
         mu, logvar = encoded['mu'], encoded['logvar']
         kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
         
         # Temporal consistency loss (for video sequences)
         temporal_loss = torch.tensor(0.0, device=x.device)
         if x.size(2) > 1:  # If depth > 1, compute temporal consistency
+            # Use the multi-channel latent for temporal consistency
             z_diff = z[:, :, 1:] - z[:, :, :-1]
             temporal_loss = torch.mean(z_diff.pow(2))
         
@@ -160,8 +176,8 @@ class LungCTVAE(nn.Module):
             return {
                 'reconstruction': x_recon,
                 'latent': z,
-                'mu': mu,
-                'logvar': logvar,
+                'mu': mu,  # Original 1-channel
+                'logvar': logvar,  # Original 1-channel
                 'loss_recon': recon_loss,
                 'loss_kl': kl_loss,
                 'loss_temporal': temporal_loss,
