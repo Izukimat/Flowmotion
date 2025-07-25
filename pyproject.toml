@@ -17,12 +17,9 @@ dependencies = [
     "tciaclient (>=0.0.3,<0.0.4)",
     "pandas (>=2.2.3,<3.0.0)",
     "simpleitk (>=2.5.0,<3.0.0)",
-    "wandb (>=0.21.0,<0.22.0)",
+    "wandb (>=0.14.0,<0.22.0)",
     "medvae (>=0.1.4,<0.2.0)"
 ]
-
-[tool.poetry.dependency-overrides]
-wandb = ">=0.21.0,<0.22.0"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
