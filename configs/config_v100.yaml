@@ -9,8 +9,8 @@ model:
   # DiT settings - scaled down for V100
   dit_config:
     latent_channels: 8
-    latent_size: [5, 16, 16]  # After 8x compression of 40x128x128
-    hidden_dim: 512  # Reduced from 768
+    latent_size: [10, 32, 32]  # After 8x compression of 82x512x512
+    hidden_dim: 512  # Reduced from 768 for V100
     depth: 12  # Reduced from 24
     num_heads: 8
     mlp_ratio: 4.0
@@ -49,13 +49,37 @@ training:
   batch_size: 1  # Per GPU
   gradient_accumulation_steps: 4  # Effective batch size of 4
   mixed_precision: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false  # Disabled for memory saving
+  
+  # Scheduler settings
+  scheduler_type: 'cosine'  # 'cosine', 'linear', or 'constant'
+  warmup_epochs: 5
 
 data:
-  # Data settings
-  num_frames: 20  # Start with fewer frames
-  target_size: [128, 128, 20]
-  slice_mode: 'three_slices'  # Use strategic slices
-  slice_indices: [10, 25, 40]  # Apex, middle, base
-  intensity_window: [-1000, 500]  # Lung window
-
+  # Data settings - Updated for NumPy array structure
+  num_frames: 82  # Full interpolated sequence length from target_frames.npy
+  input_frames: 10  # Number of input frames from input_frames.npy
+  target_size: [512, 512, 82]  # [H, W, T] - actual data dimensions
+  
+  # Image processing settings
+  intensity_window: [-1000, 500]  # Lung window (HU values)
+  normalize: true  # Apply lung windowing and normalize to [-1, 1]
+  
+  # Data augmentation settings
+  augmentation:
+    intensity_scale: 0.05  # Random intensity scaling
+    intensity_shift: 0.05  # Random intensity shifts
+    noise_std: 0.01  # Random noise
+    enable_augmentation: true  # Enable during training
+  
+  # Phase range settings - for full breathing cycle
+  phase_range: '0-100'  # Full breathing cycle (no filtering)
+  
+  # Experiment filtering (optional - can filter specific interpolation methods)
+  # experiment_filter: ['hfr_optical_flow_8fps', 'hfr_linear_8fps']  # Uncomment to filter
+  
+# Inference settings
+inference:
+  guidance_scale: 1.0
+  num_sampling_steps: 50
+  batch_size: 1  # Small batch for inference due to image size

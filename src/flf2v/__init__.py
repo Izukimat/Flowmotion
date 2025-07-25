@@ -1,28 +1,25 @@
 """
-flf2v – Lung-CT first-last-frame-to-video toolkit
-Makes sub-modules available as `import flf2v.<thing>`.
+FLF2V Package - First-Last Frame to Video for Lung CT
+Canonical imports for all components
 """
 
-from .vae import LungCTVAE, VAELoss
-from .dit import create_dit_model, LungCTDiT
-from .flow_matching import (
-    create_flow_matching_model,
-    FlowMatching,
-    FlowMatchingConfig,
-)
-from .model import LungCTFLF2V
-from .datasets import LungCTDataset
-from .trainer import FLF2VTrainer
+# Import canonical dataset and utilities
+from .datasets import LungCTDataset, lungct_collate_fn
 
+# Import model components
+from .lungct_flf2v_model import LungCTFLF2V, FLF2VTrainer
+
+# Package metadata
+__version__ = "0.1.0"
+__author__ = "Lung CT FLF2V Team"
+
+# Canonical exports - single source of truth
 __all__ = [
-    "LungCTVAE",
-    "VAELoss",
-    "create_dit_model",
-    "LungCTDiT",
-    "create_flow_matching_model",
-    "FlowMatching",
-    "FlowMatchingConfig",
-    "LungCTFLF2V",
-    "LungCTDataset",
-    "FLF2VTrainer",
+    # Dataset and utilities
+    'LungCTDataset',
+    'lungct_collate_fn',
+    
+    # Model and training
+    'LungCTFLF2V',
+    'FLF2VTrainer',
 ]

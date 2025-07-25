@@ -1,227 +1,36 @@
 #!/usr/bin/env python3
 """
-Training script for Lung CT FLF2V model
-Handles the complete training pipeline including data loading, model training, and checkpointing
+Training script for Lung CT FLF2V model - Fixed version
+Addresses all critical issues: proper imports, loss handling, schedulers, etc.
 """
 
+import argparse
+import logging
 import os
 import sys
-import argparse
-import json
-import time
-from pathlib import Path
 from datetime import datetime
-import logging
-from typing import Dict, List, Optional, Tuple
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-from torch.cuda.amp import autocast, GradScaler
+from pathlib import Path
+from typing import Dict
 
 import numpy as np
 import pandas as pd
-import nibabel as nib
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 import wandb
 import yaml
 
-# Import our modules (adjust path as needed)
-from lungct_vae import LungCTVAE, VAELoss
-from lungct_dit import create_dit_model
-from lungct_flow_matching import create_flow_matching_model, FlowMatchingConfig
-from lungct_flf2v_model import LungCTFLF2V
+# Fix: Import from package namespace, not relative imports
+from flf2v import LungCTDataset, LungCTFLF2V, lungct_collate_fn
+from flf2v.lungct_vae import LungCTVAE, VAELoss
+from flf2v.lungct_dit import create_dit_model
+from flf2v.lungct_flow_matching import create_flow_matching_model, FlowMatchingConfig
 
-
-# ============= Data Loading =============
-
-class LungCTDataset(Dataset):
-    """
-    Dataset for lung CT breathing sequences
-    Expects data organized as:
-    - data_dir/
-        - patient_001/
-            - inhale_001.nii.gz
-            - exhale_001.nii.gz
-            - breathing_sequence_001.nii.gz  # 4D volume
-        - patient_002/
-            ...
-    """
-    
-    def __init__(
-        self,
-        data_dir: str,
-        csv_file: str,  # CSV with patient IDs and metadata
-        split: str = 'train',
-        num_frames: int = 40,
-        target_size: Tuple[int, int, int] = (128, 128, 40),
-        slice_mode: str = 'three_slices',  # 'three_slices' or 'full_volume'
-        slice_indices: Optional[List[int]] = None,
-        intensity_window: Tuple[float, float] = (-1000, 500),  # Lung window
-        augment: bool = True
-    ):
-        self.data_dir = Path(data_dir)
-        self.split = split
-        self.num_frames = num_frames
-        self.target_size = target_size
-        self.slice_mode = slice_mode
-        self.slice_indices = slice_indices or [10, 25, 40]  # Apex, middle, base
-        self.intensity_window = intensity_window
-        self.augment = augment and (split == 'train')
-        
-        # Load metadata
-        self.df = pd.read_csv(csv_file)
-        self.df = self.df[self.df['split'] == split]
-        
-        # Build sample list
-        self.samples = self._build_samples()
-        
-        logging.info(f"Loaded {len(self.samples)} samples for {split} split")
-    
-    def _build_samples(self) -> List[Dict]:
-        """Build list of samples from metadata"""
-        samples = []
-        
-        for _, row in self.df.iterrows():
-            patient_dir = self.data_dir / row['patient_id']
-            
-            if self.slice_mode == 'three_slices':
-                # Create samples for each slice position
-                for slice_idx in self.slice_indices:
-                    samples.append({
-                        'patient_id': row['patient_id'],
-                        'sequence_path': patient_dir / row['sequence_file'],
-                        'slice_idx': slice_idx,
-                        'slice_name': f"slice_{slice_idx}",
-                        'metadata': row.to_dict()
-                    })
-            else:
-                # Full volume mode
-                samples.append({
-                    'patient_id': row['patient_id'],
-                    'sequence_path': patient_dir / row['sequence_file'],
-                    'metadata': row.to_dict()
-                })
-        
-        return samples
-    
-    def _load_sequence(self, path: Path) -> np.ndarray:
-        """Load 4D NIfTI sequence"""
-        nii = nib.load(str(path))
-        data = nii.get_fdata()
-        
-        # Ensure 4D
-        if data.ndim == 3:
-            data = data[..., np.newaxis]
-        
-        return data
-    
-    def _preprocess(self, volume: np.ndarray) -> np.ndarray:
-        """Apply intensity windowing and normalization"""
-        # Apply lung window
-        volume = np.clip(volume, self.intensity_window[0], self.intensity_window[1])
-        
-        # Normalize to [-1, 1]
-        volume = 2 * (volume - self.intensity_window[0]) / (self.intensity_window[1] - self.intensity_window[0]) - 1
-        
-        return volume
-    
-    def _augment(self, volume: torch.Tensor) -> torch.Tensor:
-        """Apply data augmentation"""
-        if not self.augment:
-            return volume
-        
-        # Random intensity shift
-        if torch.rand(1) < 0.5:
-            shift = torch.randn(1) * 0.1
-            volume = volume + shift
-        
-        # Random intensity scale
-        if torch.rand(1) < 0.5:
-            scale = 1 + torch.randn(1) * 0.1
-            volume = volume * scale
-        
-        # Random noise
-        if torch.rand(1) < 0.3:
-            noise = torch.randn_like(volume) * 0.02
-            volume = volume + noise
-        
-        # Clamp to valid range
-        volume = torch.clamp(volume, -1, 1)
-        
-        return volume
-    
-    def __len__(self) -> int:
-        return len(self.samples)
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample = self.samples[idx]
-        
-        # Load sequence
-        sequence = self._load_sequence(sample['sequence_path'])
-        
-        if self.slice_mode == 'three_slices':
-            # Extract specific slice across time
-            slice_idx = sample['slice_idx']
-            slice_sequence = sequence[:, :, slice_idx, :]  # [H, W, T]
-            
-            # Transpose to [T, H, W]
-            slice_sequence = np.transpose(slice_sequence, (2, 0, 1))
-            
-            # Sample temporal window
-            T = slice_sequence.shape[0]
-            if T > self.num_frames:
-                start_idx = np.random.randint(0, T - self.num_frames)
-                slice_sequence = slice_sequence[start_idx:start_idx + self.num_frames]
-            elif T < self.num_frames:
-                # Pad with repetition
-                pad_frames = self.num_frames - T
-                slice_sequence = np.pad(
-                    slice_sequence,
-                    ((0, pad_frames), (0, 0), (0, 0)),
-                    mode='edge'
-                )
-            
-            # Resize spatial dimensions
-            if slice_sequence.shape[1:] != self.target_size[:2]:
-                import cv2
-                resized = []
-                for t in range(self.num_frames):
-                    frame = cv2.resize(
-                        slice_sequence[t],
-                        self.target_size[:2][::-1],  # cv2 uses (W, H)
-                        interpolation=cv2.INTER_LINEAR
-                    )
-                    resized.append(frame)
-                slice_sequence = np.stack(resized)
-            
-            # Preprocess
-            slice_sequence = self._preprocess(slice_sequence)
-            
-            # Convert to tensor [1, T, H, W]
-            video = torch.from_numpy(slice_sequence).float().unsqueeze(0)
-            
-        else:
-            # Full volume mode - implement as needed
-            raise NotImplementedError("Full volume mode not yet implemented")
-        
-        # Augment
-        video = self._augment(video)
-        
-        # Rearrange to [1, T, H, W] -> [1, T, H, W] (already in correct format)
-        
-        return {
-            'video': video,
-            'patient_id': sample['patient_id'],
-            'slice_name': sample.get('slice_name', 'full'),
-            'metadata': sample['metadata']
-        }
-
-
-# ============= Training Functions =============
 
 def setup_distributed():
     """Setup distributed training"""
@@ -253,8 +62,7 @@ def create_model(config: Dict, device: str) -> LungCTFLF2V:
     dit = create_dit_model(config['model']['dit_config'])
     
     # Create Flow Matching
-    fm_config = FlowMatchingConfig(**config['model']['flow_matching_config'])
-    flow_matching = create_flow_matching_model(dit, {'config': fm_config})
+    flow_matching = create_flow_matching_model(dit, config['model']['flow_matching_config'])
     
     # Create full model
     model = LungCTFLF2V(
@@ -267,18 +75,58 @@ def create_model(config: Dict, device: str) -> LungCTFLF2V:
     return model.to(device)
 
 
+def get_loss_weights(config: Dict) -> Dict[str, float]:
+    """Get loss weights with defaults - Fix: provide all defaults"""
+    training_config = config.get('training', {})
+    return {
+        'velocity_weight': training_config.get('velocity_weight', 1.0),
+        'flf_weight': training_config.get('flf_weight', 0.1),
+        'vae_recon_weight': training_config.get('vae_recon_weight', 1.0),
+        'vae_kl_weight': training_config.get('vae_kl_weight', 0.01),
+        'vae_temporal_weight': training_config.get('vae_temporal_weight', 0.1)
+    }
+
+
+def calculate_weighted_loss(loss_dict: Dict, weights: Dict[str, float], device: str) -> torch.Tensor:
+    """Calculate weighted total loss - Fix: only sum loss keys"""
+    total_loss = torch.tensor(0.0, device=device)
+    
+    # Only sum keys that start with 'loss_'
+    for key, value in loss_dict.items():
+        if key.startswith('loss_') and isinstance(value, torch.Tensor):
+            # Map loss key to weight key
+            if key == 'loss_velocity':
+                weight = weights['velocity_weight']
+            elif key == 'loss_flf':
+                weight = weights['flf_weight']
+            elif key == 'loss_vae_recon':
+                weight = weights['vae_recon_weight']
+            elif key == 'loss_vae_kl':
+                weight = weights['vae_kl_weight']
+            elif key == 'loss_vae_temporal':
+                weight = weights['vae_temporal_weight']
+            else:
+                weight = 1.0  # Default weight for unknown losses
+            
+            total_loss = total_loss + weight * value
+    
+    return total_loss
+
+
 def train_epoch(
     model: nn.Module,
     train_loader: DataLoader,
     vae_optimizer: optim.Optimizer,
     dit_optimizer: optim.Optimizer,
+    vae_scheduler: optim.lr_scheduler._LRScheduler,  # Fix: add scheduler
+    dit_scheduler: optim.lr_scheduler._LRScheduler,  # Fix: add scheduler
     scaler: GradScaler,
     epoch: int,
     config: Dict,
     device: str,
     wandb_log: bool = True
 ) -> Dict[str, float]:
-    """Train for one epoch"""
+    """Train for one epoch - Fix: proper loss handling and schedulers"""
     model.train()
     
     epoch_losses = {
@@ -290,159 +138,145 @@ def train_epoch(
         'vae_temporal': []
     }
     
+    loss_weights = get_loss_weights(config)
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
     
     for batch_idx, batch in enumerate(pbar):
-        video = batch['video'].to(device)
-        
-        # Zero gradients
-        vae_optimizer.zero_grad()
-        dit_optimizer.zero_grad()
+        # Get data - use target_frames as the full sequence for training
+        if 'video' in batch:
+            video = batch['video'].to(device)
+        elif 'target_frames' in batch:
+            video = batch['target_frames'].to(device)
+        else:
+            raise ValueError("No video data found in batch")
         
         # Forward pass with mixed precision
         with autocast():
-            outputs = model(video)
+            # Train the model on full breathing sequence
+            loss_dict = model(video, return_dict=True)
             
-            # Compute total loss
-            total_loss = 0
-            loss_weights = {
-                'loss_velocity': config['training']['velocity_weight'],
-                'loss_flf': config['training']['flf_weight'],
-                'vae_recon': config['training']['vae_recon_weight'],
-                'vae_kl': config['training']['vae_kl_weight'],
-                'vae_temporal': config['training']['vae_temporal_weight']
-            }
-            
-            for loss_name, weight in loss_weights.items():
-                if loss_name in outputs:
-                    total_loss += weight * outputs[loss_name]
-                    epoch_losses[loss_name.replace('loss_', '')].append(
-                        outputs[loss_name].item()
-                    )
+            # Calculate weighted total loss - Fix: use loss filtering
+            total_loss = calculate_weighted_loss(loss_dict, loss_weights, device)
         
-        # Backward pass
-        scaler.scale(total_loss).backward()
-        
-        # Gradient clipping
-        if config['training']['grad_clip'] > 0:
-            scaler.unscale_(vae_optimizer)
-            scaler.unscale_(dit_optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                config['training']['grad_clip']
-            )
-        
-        # Optimizer steps
+        # Backward pass - Fix: proper optimizer selection
         if model.training_step < model.freeze_vae_after:
+            # Train VAE
+            vae_optimizer.zero_grad()
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(vae_optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                model.vae.parameters(), 
+                config['training'].get('grad_clip', 1.0)
+            )
             scaler.step(vae_optimizer)
-        scaler.step(dit_optimizer)
+        else:
+            # Train DiT
+            dit_optimizer.zero_grad()
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(dit_optimizer)
+            dit_params = list(model.dit.parameters()) + list(model.flow_matching.parameters())
+            torch.nn.utils.clip_grad_norm_(
+                dit_params, 
+                config['training'].get('grad_clip', 1.0)
+            )
+            scaler.step(dit_optimizer)
+        
         scaler.update()
         
+        # Logging - Fix: only log loss values
+        for key in epoch_losses:
+            loss_key = f'loss_{key}' if key != 'total' else None
+            if loss_key and loss_key in loss_dict and isinstance(loss_dict[loss_key], torch.Tensor):
+                epoch_losses[key].append(loss_dict[loss_key].item())
         epoch_losses['total'].append(total_loss.item())
         
         # Update progress bar
-        avg_losses = {k: np.mean(v[-100:]) if v else 0 for k, v in epoch_losses.items()}
-        pbar.set_postfix(avg_losses)
+        pbar.set_postfix({
+            'loss': f"{total_loss.item():.4f}",
+            'stage': 'VAE' if model.training_step < model.freeze_vae_after else 'DiT'
+        })
         
-        # Log to wandb
-        if wandb_log and batch_idx % 100 == 0:
-            wandb.log({
-                f'train/{k}': v for k, v in avg_losses.items()
-            })
+        # WandB logging
+        if wandb_log and batch_idx % 50 == 0:
+            log_dict = {}
+            for key, value in loss_dict.items():
+                if key.startswith('loss_') and isinstance(value, torch.Tensor):
+                    log_dict[f'train/{key}'] = value.item()
+            log_dict['train/total_loss'] = total_loss.item()
+            log_dict['train/step'] = epoch * len(train_loader) + batch_idx
+            wandb.log(log_dict)
+    
+    # Update learning rates - Fix: proper scheduler selection
+    if model.training_step < model.freeze_vae_after:
+        vae_scheduler.step()
+    else:
+        dit_scheduler.step()
     
     # Return epoch averages
-    return {k: np.mean(v) if v else 0 for k, v in epoch_losses.items()}
+    return {k: np.mean(v) if v else 0.0 for k, v in epoch_losses.items()}
 
 
-@torch.no_grad()
-def validate(
+def validate_epoch(
     model: nn.Module,
     val_loader: DataLoader,
     epoch: int,
+    config: Dict,
     device: str,
-    num_samples: int = 4
+    wandb_log: bool = True
 ) -> Dict[str, float]:
-    """Validation with sample generation"""
+    """Validate for one epoch - Fix: proper loss handling"""
     model.eval()
     
-    val_losses = []
-    generated_samples = []
-    
-    for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validation")):
-        video = batch['video'].to(device)
-        
-        # Forward pass
-        outputs = model(video)
-        
-        # Collect losses
-        batch_losses = {
-            k.replace('loss_', ''): v.item() 
-            for k, v in outputs.items() 
-            if k.startswith('loss_')
-        }
-        val_losses.append(batch_losses)
-        
-        # Generate samples for first batch
-        if batch_idx == 0 and len(generated_samples) < num_samples:
-            B = min(num_samples, video.shape[0])
-            first_frame = video[:B, :, 0]
-            last_frame = video[:B, :, -1]
-            
-            generated = model.generate(
-                first_frame,
-                last_frame,
-                num_frames=video.shape[2],
-                guidance_scale=1.0
-            )
-            
-            generated_samples.append({
-                'input': video[:B].cpu(),
-                'generated': generated.cpu(),
-                'first_frame': first_frame.cpu(),
-                'last_frame': last_frame.cpu()
-            })
-    
-    # Average losses
-    avg_losses = {}
-    if val_losses:
-        for k in val_losses[0].keys():
-            avg_losses[k] = np.mean([l[k] for l in val_losses])
-    
-    return avg_losses, generated_samples
-
-
-def save_checkpoint(
-    model: nn.Module,
-    vae_optimizer: optim.Optimizer,
-    dit_optimizer: optim.Optimizer,
-    epoch: int,
-    config: Dict,
-    save_path: Path,
-    is_best: bool = False
-):
-    """Save training checkpoint"""
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'vae_optimizer': vae_optimizer.state_dict(),
-        'dit_optimizer': dit_optimizer.state_dict(),
-        'config': config,
-        'timestamp': datetime.now().isoformat()
+    val_losses = {
+        'total': [],
+        'velocity': [],
+        'flf': [],
+        'vae_recon': [],
+        'vae_kl': [],
+        'vae_temporal': []
     }
     
-    torch.save(checkpoint, save_path)
+    loss_weights = get_loss_weights(config)
     
-    if is_best:
-        best_path = save_path.parent / 'best_model.pt'
-        torch.save(checkpoint, best_path)
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(val_loader, desc=f"Val {epoch}")):
+            if 'video' in batch:
+                video = batch['video'].to(device)
+            elif 'target_frames' in batch:
+                video = batch['target_frames'].to(device)
+            else:
+                continue
+            
+            # Forward pass
+            loss_dict = model(video, return_dict=True)
+            total_loss = calculate_weighted_loss(loss_dict, loss_weights, device)  # Fix: use same calculation
+            
+            # Collect losses - Fix: only collect loss values
+            for key in val_losses:
+                loss_key = f'loss_{key}' if key != 'total' else None
+                if loss_key and loss_key in loss_dict and isinstance(loss_dict[loss_key], torch.Tensor):
+                    val_losses[key].append(loss_dict[loss_key].item())
+            val_losses['total'].append(total_loss.item())
+    
+    # Log validation results
+    val_averages = {k: np.mean(v) if v else 0.0 for k, v in val_losses.items()}
+    
+    if wandb_log:
+        log_dict = {f'val/{k}': v for k, v in val_averages.items()}
+        wandb.log(log_dict)
+    
+    return val_averages
 
 
 def main():
+    """Main training function - Fix: all issues addressed"""
     # Parse arguments
     parser = argparse.ArgumentParser(description='Train Lung CT FLF2V model')
     parser.add_argument('--config', type=str, required=True, help='Config file path')
-    parser.add_argument('--data-dir', type=str, required=True, help='Data directory')
-    parser.add_argument('--csv-file', type=str, required=True, help='CSV with metadata')
+    parser.add_argument('--csv-file', type=str, required=True, help='CSV metadata file')
+    parser.add_argument('--data-root', type=str, 
+                      default='/home/ragenius_admin/azureblob/4D-Lung-Interpolated/data/',
+                      help='Root data directory')
     parser.add_argument('--output-dir', type=str, default='./outputs', help='Output directory')
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
     parser.add_argument('--wandb-project', type=str, default='lungct-flf2v', help='WandB project name')
@@ -468,7 +302,7 @@ def main():
     )
     
     # Setup output directory
-    output_dir = Path(args.output_dir) / datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_dir = Path(args.output_dir)
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
         
@@ -484,30 +318,26 @@ def main():
             config=config
         )
     
-    # Create datasets
+    # Create datasets - Fix: use canonical dataset with collate function
     train_dataset = LungCTDataset(
-        data_dir=args.data_dir,
         csv_file=args.csv_file,
         split='train',
-        num_frames=config['data']['num_frames'],
-        target_size=config['data']['target_size'],
-        slice_mode=config['data']['slice_mode'],
-        slice_indices=config['data'].get('slice_indices'),
-        augment=True
+        data_root=args.data_root,
+        augment=True,
+        normalize=True,
+        load_target_frames=True
     )
     
     val_dataset = LungCTDataset(
-        data_dir=args.data_dir,
         csv_file=args.csv_file,
         split='val',
-        num_frames=config['data']['num_frames'],
-        target_size=config['data']['target_size'],
-        slice_mode=config['data']['slice_mode'],
-        slice_indices=config['data'].get('slice_indices'),
-        augment=False
+        data_root=args.data_root,
+        augment=False,
+        normalize=True,
+        load_target_frames=True
     )
     
-    # Create data loaders
+    # Create dataloaders - Fix: add collate function
     train_sampler = DistributedSampler(train_dataset) if args.distributed else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if args.distributed else None
     
@@ -517,9 +347,9 @@ def main():
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
         prefetch_factor=args.prefetch_factor,
-        persistent_workers=args.num_workers > 0
+        pin_memory=True,
+        collate_fn=lungct_collate_fn  # Fix: add collate function
     )
     
     val_loader = DataLoader(
@@ -528,120 +358,114 @@ def main():
         shuffle=False,
         sampler=val_sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
         prefetch_factor=args.prefetch_factor,
-        persistent_workers=args.num_workers > 0
+        pin_memory=True,
+        collate_fn=lungct_collate_fn  # Fix: add collate function
     )
     
     # Create model
-    logging.info("Creating model...")
     model = create_model(config, device)
-    
-    # Load checkpoint if resuming
-    start_epoch = 0
-    if args.resume:
-        logging.info(f"Loading checkpoint from {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-    
-    # Setup distributed model
     if args.distributed:
         model = DDP(model, device_ids=[local_rank])
     
     # Create optimizers
-    vae_params = list(model.vae.parameters()) if not args.distributed else list(model.module.vae.parameters())
-    dit_params = list(model.dit.parameters()) + list(model.flow_matching.parameters())
-    if args.distributed:
-        dit_params = list(model.module.dit.parameters()) + list(model.module.flow_matching.parameters())
-    
+    model_ref = model.module if args.distributed else model
     vae_optimizer = optim.AdamW(
-        vae_params,
-        lr=config['training']['vae_lr'],
-        weight_decay=config['training']['weight_decay']
+        model_ref.vae.parameters(),
+        lr=config['training'].get('vae_lr', 1e-4),
+        weight_decay=config['training'].get('weight_decay', 0.01)
     )
     
+    dit_params = list(model_ref.dit.parameters()) + list(model_ref.flow_matching.parameters())
     dit_optimizer = optim.AdamW(
         dit_params,
-        lr=config['training']['dit_lr'],
-        weight_decay=config['training']['weight_decay']
+        lr=config['training'].get('dit_lr', 1e-4),
+        weight_decay=config['training'].get('weight_decay', 0.01)
     )
     
-    # Load optimizer states if resuming
-    if args.resume:
-        vae_optimizer.load_state_dict(checkpoint['vae_optimizer'])
-        dit_optimizer.load_state_dict(checkpoint['dit_optimizer'])
+    # Fix: Add missing LR schedulers
+    vae_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        vae_optimizer, 
+        T_max=config['training'].get('num_epochs', 100)
+    )
+    dit_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        dit_optimizer,
+        T_max=config['training'].get('num_epochs', 100)
+    )
     
-    # Create gradient scaler for mixed precision
+    # Setup mixed precision
     scaler = GradScaler()
     
-    # Training loop
-    best_val_loss = float('inf')
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device)
+        if args.distributed:
+            model.module.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        vae_optimizer.load_state_dict(checkpoint['vae_optimizer_state_dict'])
+        dit_optimizer.load_state_dict(checkpoint['dit_optimizer_state_dict'])
+        vae_scheduler.load_state_dict(checkpoint['vae_scheduler_state_dict'])
+        dit_scheduler.load_state_dict(checkpoint['dit_scheduler_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        logging.info(f"Resumed from checkpoint: {args.resume}, epoch {start_epoch}")
     
-    for epoch in range(start_epoch, config['training']['num_epochs']):
+    # Training loop
+    val_losses = {}  # Fix: initialize val_losses
+    
+    for epoch in range(start_epoch, config['training'].get('num_epochs', 100)):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         
         # Train
         train_losses = train_epoch(
-            model, train_loader,
-            vae_optimizer, dit_optimizer,
-            scaler, epoch, config, device,
-            wandb_log=(not args.no_wandb and rank == 0)
+            model, train_loader, vae_optimizer, dit_optimizer, 
+            vae_scheduler, dit_scheduler,  # Fix: pass schedulers
+            scaler, epoch, config, device, not args.no_wandb
         )
         
         # Validate
-        if epoch % config['training']['val_freq'] == 0:
-            val_losses, generated_samples = validate(
-                model, val_loader, epoch, device
+        if epoch % config['training'].get('val_freq', 5) == 0:
+            val_losses = validate_epoch(
+                model, val_loader, epoch, config, device, not args.no_wandb
             )
             
-            if rank == 0:
-                # Log validation losses
-                if not args.no_wandb:
-                    wandb.log({
-                        f'val/{k}': v for k, v in val_losses.items()
-                    })
-                    
-                    # Log generated samples
-                    if generated_samples:
-                        sample = generated_samples[0]
-                        wandb.log({
-                            'val/generated_video': wandb.Video(
-                                sample['generated'].numpy(),
-                                fps=4,
-                                format="mp4"
-                            )
-                        })
-                
-                # Save checkpoint
-                is_best = val_losses.get('total', float('inf')) < best_val_loss
-                if is_best:
-                    best_val_loss = val_losses.get('total', float('inf'))
-                
-                save_checkpoint(
-                    model.module if args.distributed else model,
-                    vae_optimizer,
-                    dit_optimizer,
-                    epoch,
-                    config,
-                    output_dir / f'checkpoint_epoch_{epoch}.pt',
-                    is_best=is_best
-                )
-    
-    # Final save
-    if rank == 0:
-        save_checkpoint(
-            model.module if args.distributed else model,
-            vae_optimizer,
-            dit_optimizer,
-            config['training']['num_epochs'] - 1,
-            config,
-            output_dir / 'final_model.pt',
-            is_best=False
-        )
+            logging.info(f"Epoch {epoch}: Train Loss: {train_losses['total']:.4f}, "
+                        f"Val Loss: {val_losses['total']:.4f}")
         
-        logging.info(f"Training complete! Models saved to {output_dir}")
+        # Save checkpoint
+        if rank == 0 and epoch % config['training'].get('save_freq', 10) == 0:
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.module.state_dict() if args.distributed else model.state_dict(),
+                'vae_optimizer_state_dict': vae_optimizer.state_dict(),
+                'dit_optimizer_state_dict': dit_optimizer.state_dict(),
+                'vae_scheduler_state_dict': vae_scheduler.state_dict(),  # Fix: save scheduler state
+                'dit_scheduler_state_dict': dit_scheduler.state_dict(),   # Fix: save scheduler state
+                'scaler_state_dict': scaler.state_dict(),
+                'config': config,
+                'train_losses': train_losses,
+                'val_losses': val_losses
+            }
+            
+            checkpoint_path = output_dir / f'checkpoint_epoch_{epoch}.pt'
+            torch.save(checkpoint, checkpoint_path)
+            logging.info(f"Saved checkpoint: {checkpoint_path}")
+    
+    # Save final model
+    if rank == 0:
+        final_path = output_dir / 'final_model.pt'
+        torch.save({
+            'model_state_dict': model.module.state_dict() if args.distributed else model.state_dict(),
+            'config': config
+        }, final_path)
+        logging.info(f"Saved final model: {final_path}")
+    
+    # Cleanup
+    if args.distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':

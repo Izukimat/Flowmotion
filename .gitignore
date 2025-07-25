@@ -38,3 +38,6 @@ Thumbs.db
 .env
 .venv/
 venv/
+
+# wandb
+wandb/

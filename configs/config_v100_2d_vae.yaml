@@ -1,0 +1,105 @@
+# config_v100_2d_vae.yaml - Memory-efficient 2D VAE configuration
+# Using 2D VAE for temporal video generation of CT slices
+
+model:
+  # VAE settings - Switch to 2D model for memory efficiency
+  vae_base_model: 'medvae_8x4'  # 2D model with 64x compression, 4 channels
+  vae_model_path: 'vae_8x_4c_2D.ckpt'  # 2D checkpoint
+  latent_channels: 4  # Reduced from 8 to 4 (2D model)
+  vae_temporal_weight: 0.1
+  freeze_vae_after: 5000
+  
+  # DiT settings - Updated for 2D VAE latent dimensions
+  dit_config:
+    latent_channels: 4  # Match VAE latent channels
+    latent_size: [10, 64, 64]  # [T, H/8, W/8] for 82x512x512 -> 82x64x64 latents
+    hidden_dim: 384  # Reduced further for V100
+    depth: 8  # Reduced from 12 for memory
+    num_heads: 6
+    mlp_ratio: 4.0
+    dropout: 0.1
+    use_rope: true
+  
+  # Flow matching settings
+  flow_matching_config:
+    num_sampling_steps: 50
+    sigma_min: 1.0e-5
+    use_ode_solver: 'euler'
+    time_sampling: 'uniform'
+    loss_weighting: 'uniform'
+    interpolation_method: 'optimal_transport'
+
+training:
+  # Optimization
+  vae_lr: 5.0e-5  # Lower LR for pre-trained 2D VAE
+  dit_lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  
+  # Loss weights - Reduced VAE weights since it's pre-trained
+  velocity_weight: 1.0
+  flf_weight: 0.1
+  vae_recon_weight: 0.1  # Reduced - VAE is pre-trained
+  vae_kl_weight: 0.001   # Reduced - VAE is pre-trained
+  vae_temporal_weight: 0.05  # Reduced
+  
+  # Training schedule
+  num_epochs: 100
+  val_freq: 5
+  save_freq: 10
+  
+  # Batch settings for V100 with 2D VAE (much more memory efficient)
+  batch_size: 2  # Can increase from 1 to 2 with 2D VAE
+  gradient_accumulation_steps: 4  # Effective batch size of 8
+  mixed_precision: true
+  gradient_checkpointing: true
+  
+  # VAE fine-tuning settings
+  finetune_vae: true  # Whether to fine-tune VAE on CT data
+  freeze_vae_after: 2000  # Earlier freeze since it's pre-trained
+  
+  # Scheduler settings
+  scheduler_type: 'cosine'
+  warmup_epochs: 3  # Shorter warmup for pre-trained VAE
+
+data:
+  # Data settings - Same as before
+  num_frames: 82
+  input_frames: 10
+  target_size: [512, 512, 82]
+  
+  # Image processing - Important for X-ray -> CT adaptation
+  intensity_window: [-1000, 500]  # Lung window (HU values)
+  normalize: true
+  
+  # Enhanced preprocessing for X-ray VAE adaptation
+  preprocessing:
+    # Convert CT HU values to X-ray-like appearance
+    ct_to_xray_transform: true
+    # Apply histogram matching if needed
+    histogram_matching: false
+    # Intensity scaling for better VAE compatibility
+    intensity_scaling: 'adaptive'
+  
+  # Data augmentation
+  augmentation:
+    intensity_scale: 0.03  # Reduced for pre-trained VAE
+    intensity_shift: 0.03  # Reduced for pre-trained VAE
+    noise_std: 0.005  # Reduced
+    enable_augmentation: true
+  
+  # Phase range settings
+  phase_range: '0-100'
+
+# Memory optimization settings
+memory:
+  # Enable memory optimization techniques
+  use_checkpoint: true
+  clear_cache_frequency: 10  # Clear cache every N batches
+  max_memory_allocated: 14.0  # GB - leave some headroom on V100
+  
+# Inference settings
+inference:
+  guidance_scale: 1.0
+  num_sampling_steps: 50
+  batch_size: 1

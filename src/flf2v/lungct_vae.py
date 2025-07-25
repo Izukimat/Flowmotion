@@ -5,7 +5,6 @@ Extends MedVAE 3D with increased channels and temporal consistency
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from omegaconf import OmegaConf
 from typing import Dict, Tuple, Optional
 import numpy as np
 from medvae.models import AutoencoderKL_3D
