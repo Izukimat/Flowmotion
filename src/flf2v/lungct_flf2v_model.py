@@ -14,7 +14,7 @@ import torch.optim as optim
 
 # Import from package namespace (Fix: proper imports)
 from .lungct_vae import LungCTVAE
-from .lungct_dit import DiTBlock
+from .lungct_dit import LungCTDiT
 from .lungct_flow_matching import FlowMatching
 
 
@@ -28,7 +28,7 @@ class LungCTFLF2V(nn.Module):
     def __init__(
         self,
         vae: LungCTVAE,
-        dit: DiTBlock,
+        dit: LungCTDiT,
         flow_matching: FlowMatching,
         freeze_vae_after: int = 5000
     ):
@@ -41,7 +41,7 @@ class LungCTFLF2V(nn.Module):
         self._vae_frozen = False  # Track if VAE is actually frozen
         
     def _freeze_vae(self):
-        """Actually freeze VAE parameters - Fix: proper freezing"""
+        """Actually freeze VAE parameters"""
         if not self._vae_frozen:
             for param in self.vae.parameters():
                 param.requires_grad = False
@@ -63,7 +63,6 @@ class LungCTFLF2V(nn.Module):
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Forward pass for training
-        Fix: proper loss key naming and separation of losses from latents
         
         Args:
             video: Full breathing sequence [B, C, T, H, W]
@@ -88,6 +87,7 @@ class LungCTFLF2V(nn.Module):
             video_latent,
             first_latent,
             last_latent,
+            dit_model=self.dit,
             return_dict=True
         )
         
@@ -173,6 +173,7 @@ class LungCTFLF2V(nn.Module):
         latent_video = self.flow_matching.sample(
             first_latent,
             last_latent,
+            dit_model=self.dit,
             num_frames=num_frames,
             guidance_scale=guidance_scale
         )

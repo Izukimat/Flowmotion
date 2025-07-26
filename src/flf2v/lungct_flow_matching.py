@@ -33,13 +33,8 @@ class FlowMatching(nn.Module):
     Learns to transform noise to data distribution while preserving first/last frames
     """
     
-    def __init__(
-        self,
-        dit_model: nn.Module,
-        config: FlowMatchingConfig = None
-    ):
+    def __init__(self, config: FlowMatchingConfig = None):
         super().__init__()
-        self.dit_model = dit_model
         self.config = config or FlowMatchingConfig()
     
     def sample_time(self, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -47,7 +42,6 @@ class FlowMatching(nn.Module):
         if self.config.time_sampling == "uniform":
             t = torch.rand(batch_size, device=device)
         elif self.config.time_sampling == "logit_normal":
-            # Sample from logit-normal as in Movie Gen
             u = torch.randn(batch_size, device=device)
             t = torch.sigmoid(u)
         else:
@@ -87,6 +81,7 @@ class FlowMatching(nn.Module):
         x1: torch.Tensor,
         first_frame: torch.Tensor,
         last_frame: torch.Tensor,
+        dit_model: nn.Module,  # Fix: DiT passed as parameter, not stored
         frozen_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
@@ -118,8 +113,8 @@ class FlowMatching(nn.Module):
         xt_flf[:, :, 0] = first_frame[:, :, 0]  # First depth slice
         xt_flf[:, :, -1] = last_frame[:, :, -1]  # Last depth slice
         
-        # Predict velocity
-        vt_pred = self.dit_model(xt_flf, t, first_frame, last_frame, frozen_mask)
+        # Predict velocity using passed DiT model
+        vt_pred = dit_model(xt_flf, t, first_frame, last_frame, frozen_mask)
         
         # Compute loss with optional weighting
         if self.config.loss_weighting == "uniform":
@@ -153,6 +148,7 @@ class FlowMatching(nn.Module):
         self,
         first_frame: torch.Tensor,
         last_frame: torch.Tensor,
+        dit_model: nn.Module,
         num_frames: int,
         guidance_scale: Optional[float] = None,
         progress_bar: bool = True
@@ -209,12 +205,11 @@ class FlowMatching(nn.Module):
             
             # Predict velocity
             with torch.cuda.amp.autocast(enabled=True):
-                v = self.dit_model(x, t_batch, first_frame_full, last_frame_full, frozen_mask)
+                v = dit_model(x, t_batch, first_frame_full, last_frame_full, frozen_mask)
             
             # Classifier-free guidance if requested
             if guidance_scale is not None and guidance_scale != 1.0:
-                # Unconditional prediction (using random frames as condition)
-                v_uncond = self.dit_model(
+                v_uncond = dit_model(
                     x, t_batch,
                     torch.randn_like(first_frame_full),
                     torch.randn_like(last_frame_full),
@@ -231,7 +226,7 @@ class FlowMatching(nn.Module):
                     t_next = timesteps[i + 1]
                     t_next_batch = torch.full((B,), t_next.item(), device=device)
                     x_temp = x + dt * v
-                    v_next = self.dit_model(
+                    v_next = dit_model(
                         x_temp, t_next_batch,
                         first_frame_full, last_frame_full, frozen_mask
                     )
@@ -250,75 +245,21 @@ class FlowMatching(nn.Module):
         x1: torch.Tensor,
         first_frame: torch.Tensor,
         last_frame: torch.Tensor,
+        dit_model: nn.Module, 
+        return_dict: bool = True,
         frozen_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """Forward pass computes loss during training"""
-        return self.compute_loss(x1, first_frame, last_frame, frozen_mask)
+        return self.compute_loss(x1, first_frame, last_frame, dit_model, frozen_mask)
 
 
-class FlowMatchingLoss(nn.Module):
+def create_flow_matching_model(config: Optional[Dict] = None) -> FlowMatching:
     """
-    Combined loss function for flow matching FLF2V
+    Factory function to create flow matching model
     """
+    if config and 'config' in config:
+        fm_config = FlowMatchingConfig(**config['config'])
+    else:
+        fm_config = FlowMatchingConfig(**(config or {}))
     
-    def __init__(
-        self,
-        velocity_weight: float = 1.0,
-        flf_weight: float = 0.1,
-        smoothness_weight: float = 0.01,
-        perceptual_weight: float = 0.0
-    ):
-        super().__init__()
-        self.velocity_weight = velocity_weight
-        self.flf_weight = flf_weight
-        self.smoothness_weight = smoothness_weight
-        self.perceptual_weight = perceptual_weight
-    
-    def temporal_smoothness_loss(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute temporal smoothness loss"""
-        # First-order differences
-        dx_dt = x[:, :, 1:] - x[:, :, :-1]
-        smoothness = torch.mean(dx_dt.pow(2))
-        
-        # Second-order differences (acceleration)
-        if x.size(2) > 2:
-            d2x_dt2 = dx_dt[:, :, 1:] - dx_dt[:, :, :-1]
-            smoothness = smoothness + 0.5 * torch.mean(d2x_dt2.pow(2))
-        
-        return smoothness
-    
-    def forward(
-        self,
-        flow_losses: Dict[str, torch.Tensor],
-        generated: Optional[torch.Tensor] = None
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute total loss
-        
-        Args:
-            flow_losses: Losses from flow matching
-            generated: Optional generated samples for additional losses
-        """
-        losses = {}
-        
-        # Flow matching losses
-        losses['velocity'] = flow_losses['loss_velocity'] * self.velocity_weight
-        losses['flf'] = flow_losses['loss_flf'] * self.flf_weight
-        
-        # Optional smoothness loss on generated samples
-        if generated is not None and self.smoothness_weight > 0:
-            losses['smoothness'] = self.temporal_smoothness_loss(generated) * self.smoothness_weight
-        
-        # Total loss
-        losses['total'] = sum(losses.values())
-        
-        return losses
-
-
-def create_flow_matching_model(
-    dit_model: nn.Module,
-    config: Optional[Dict] = None
-) -> FlowMatching:
-    """Factory function to create flow matching model"""
-    fm_config = FlowMatchingConfig(**(config or {}))
-    return FlowMatching(dit_model, fm_config)
+    return FlowMatching(fm_config)

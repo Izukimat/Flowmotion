@@ -7,7 +7,7 @@ Canonical imports for all components
 from .datasets import LungCTDataset, lungct_collate_fn
 
 # Import model components
-from .lungct_flf2v_model import LungCTFLF2V, FLF2VTrainer
+from .lungct_flf2v_model import LungCTFLF2V
 
 # Package metadata
 __version__ = "0.1.0"
@@ -19,7 +19,6 @@ __all__ = [
     'LungCTDataset',
     'lungct_collate_fn',
     
-    # Model and training
+    # Model (no trainer - use scripts/train_flf2v.py)
     'LungCTFLF2V',
-    'FLF2VTrainer',
 ]

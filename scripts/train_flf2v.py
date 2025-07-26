@@ -25,11 +25,10 @@ from tqdm import tqdm
 import wandb
 import yaml
 
-# Fix: Import from package namespace, not relative imports
-from flf2v import LungCTDataset, LungCTFLF2V, lungct_collate_fn
-from flf2v.lungct_vae import LungCTVAE, VAELoss
-from flf2v.lungct_dit import create_dit_model
-from flf2v.lungct_flow_matching import create_flow_matching_model, FlowMatchingConfig
+from src.flf2v import LungCTDataset, LungCTFLF2V, lungct_collate_fn
+from src.flf2v.lungct_vae import LungCTVAE, VAELoss
+from src.flf2v.lungct_dit import create_dit_model
+from src.flf2v.lungct_flow_matching import create_flow_matching_model, FlowMatchingConfig
 
 
 def setup_distributed():
@@ -61,8 +60,9 @@ def create_model(config: Dict, device: str) -> LungCTFLF2V:
     # Create DiT
     dit = create_dit_model(config['model']['dit_config'])
     
-    # Create Flow Matching
-    flow_matching = create_flow_matching_model(dit, config['model']['flow_matching_config'])
+    # Create Flow Matching - Fix: proper config handling and no DiT duplication
+    # fm_config = FlowMatchingConfig(**)
+    flow_matching = create_flow_matching_model({'config': config['model']['flow_matching_config']})
     
     # Create full model
     model = LungCTFLF2V(
@@ -76,7 +76,7 @@ def create_model(config: Dict, device: str) -> LungCTFLF2V:
 
 
 def get_loss_weights(config: Dict) -> Dict[str, float]:
-    """Get loss weights with defaults - Fix: provide all defaults"""
+    """Get loss weights with defaults"""
     training_config = config.get('training', {})
     return {
         'velocity_weight': training_config.get('velocity_weight', 1.0),
@@ -88,7 +88,7 @@ def get_loss_weights(config: Dict) -> Dict[str, float]:
 
 
 def calculate_weighted_loss(loss_dict: Dict, weights: Dict[str, float], device: str) -> torch.Tensor:
-    """Calculate weighted total loss - Fix: only sum loss keys"""
+    """Calculate weighted total loss - only sum loss keys"""
     total_loss = torch.tensor(0.0, device=device)
     
     # Only sum keys that start with 'loss_'
@@ -118,15 +118,15 @@ def train_epoch(
     train_loader: DataLoader,
     vae_optimizer: optim.Optimizer,
     dit_optimizer: optim.Optimizer,
-    vae_scheduler: optim.lr_scheduler._LRScheduler,  # Fix: add scheduler
-    dit_scheduler: optim.lr_scheduler._LRScheduler,  # Fix: add scheduler
+    vae_scheduler: optim.lr_scheduler._LRScheduler,
+    dit_scheduler: optim.lr_scheduler._LRScheduler,
     scaler: GradScaler,
     epoch: int,
     config: Dict,
     device: str,
     wandb_log: bool = True
 ) -> Dict[str, float]:
-    """Train for one epoch - Fix: proper loss handling and schedulers"""
+    """Train for one epoch"""
     model.train()
     
     epoch_losses = {
@@ -158,7 +158,7 @@ def train_epoch(
             # Calculate weighted total loss - Fix: use loss filtering
             total_loss = calculate_weighted_loss(loss_dict, loss_weights, device)
         
-        # Backward pass - Fix: proper optimizer selection
+        # Backward pass - proper optimizer selection
         if model.training_step < model.freeze_vae_after:
             # Train VAE
             vae_optimizer.zero_grad()
@@ -183,7 +183,7 @@ def train_epoch(
         
         scaler.update()
         
-        # Logging - Fix: only log loss values
+        # Logging - only log loss values
         for key in epoch_losses:
             loss_key = f'loss_{key}' if key != 'total' else None
             if loss_key and loss_key in loss_dict and isinstance(loss_dict[loss_key], torch.Tensor):
@@ -206,7 +206,7 @@ def train_epoch(
             log_dict['train/step'] = epoch * len(train_loader) + batch_idx
             wandb.log(log_dict)
     
-    # Update learning rates - Fix: proper scheduler selection
+    # Update learning rates
     if model.training_step < model.freeze_vae_after:
         vae_scheduler.step()
     else:
@@ -224,7 +224,7 @@ def validate_epoch(
     device: str,
     wandb_log: bool = True
 ) -> Dict[str, float]:
-    """Validate for one epoch - Fix: proper loss handling"""
+    """Validate for one epoch"""
     model.eval()
     
     val_losses = {
@@ -249,9 +249,9 @@ def validate_epoch(
             
             # Forward pass
             loss_dict = model(video, return_dict=True)
-            total_loss = calculate_weighted_loss(loss_dict, loss_weights, device)  # Fix: use same calculation
+            total_loss = calculate_weighted_loss(loss_dict, loss_weights, device)
             
-            # Collect losses - Fix: only collect loss values
+            # Collect losses - only collect loss values
             for key in val_losses:
                 loss_key = f'loss_{key}' if key != 'total' else None
                 if loss_key and loss_key in loss_dict and isinstance(loss_dict[loss_key], torch.Tensor):
@@ -269,7 +269,7 @@ def validate_epoch(
 
 
 def main():
-    """Main training function - Fix: all issues addressed"""
+    """Main training function"""
     # Parse arguments
     parser = argparse.ArgumentParser(description='Train Lung CT FLF2V model')
     parser.add_argument('--config', type=str, required=True, help='Config file path')
@@ -318,7 +318,7 @@ def main():
             config=config
         )
     
-    # Create datasets - Fix: use canonical dataset with collate function
+    # Create datasets
     train_dataset = LungCTDataset(
         csv_file=args.csv_file,
         split='train',
@@ -337,7 +337,7 @@ def main():
         load_target_frames=True
     )
     
-    # Create dataloaders - Fix: add collate function
+    # Create dataloaders
     train_sampler = DistributedSampler(train_dataset) if args.distributed else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if args.distributed else None
     
@@ -349,7 +349,7 @@ def main():
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         pin_memory=True,
-        collate_fn=lungct_collate_fn  # Fix: add collate function
+        collate_fn=lungct_collate_fn
     )
     
     val_loader = DataLoader(
@@ -360,7 +360,7 @@ def main():
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         pin_memory=True,
-        collate_fn=lungct_collate_fn  # Fix: add collate function
+        collate_fn=lungct_collate_fn
     )
     
     # Create model
@@ -383,7 +383,7 @@ def main():
         weight_decay=config['training'].get('weight_decay', 0.01)
     )
     
-    # Fix: Add missing LR schedulers
+    # Add LR schedulers
     vae_scheduler = optim.lr_scheduler.CosineAnnealingLR(
         vae_optimizer, 
         T_max=config['training'].get('num_epochs', 100)
@@ -413,7 +413,7 @@ def main():
         logging.info(f"Resumed from checkpoint: {args.resume}, epoch {start_epoch}")
     
     # Training loop
-    val_losses = {}  # Fix: initialize val_losses
+    val_losses = {}  # Initialize val_losses
     
     for epoch in range(start_epoch, config['training'].get('num_epochs', 100)):
         if args.distributed:
@@ -422,7 +422,7 @@ def main():
         # Train
         train_losses = train_epoch(
             model, train_loader, vae_optimizer, dit_optimizer, 
-            vae_scheduler, dit_scheduler,  # Fix: pass schedulers
+            vae_scheduler, dit_scheduler,
             scaler, epoch, config, device, not args.no_wandb
         )
         
@@ -442,8 +442,8 @@ def main():
                 'model_state_dict': model.module.state_dict() if args.distributed else model.state_dict(),
                 'vae_optimizer_state_dict': vae_optimizer.state_dict(),
                 'dit_optimizer_state_dict': dit_optimizer.state_dict(),
-                'vae_scheduler_state_dict': vae_scheduler.state_dict(),  # Fix: save scheduler state
-                'dit_scheduler_state_dict': dit_scheduler.state_dict(),   # Fix: save scheduler state
+                'vae_scheduler_state_dict': vae_scheduler.state_dict(),
+                'dit_scheduler_state_dict': dit_scheduler.state_dict(),
                 'scaler_state_dict': scaler.state_dict(),
                 'config': config,
                 'train_losses': train_losses,
