@@ -32,8 +32,10 @@ class RoPE3D(nn.Module):
     def _build_cache(self):
         positions = torch.arange(self.max_seq_len, dtype=torch.float, device=self.inv_freq.device)
         freqs = torch.einsum("i,j->ij", positions, self.inv_freq)
-        self.register_buffer("cos_cache", freqs.cos())
-        self.register_buffer("sin_cache", freqs.sin())
+        cos = freqs.cos().repeat_interleave(2, dim=-1)  # shape = [L, dim]
+        sin = freqs.sin().repeat_interleave(2, dim=-1)  # shape = [L, dim]
+        self.register_buffer("cos_cache", cos)
+        self.register_buffer("sin_cache", sin)
     
     def forward(self, x: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
         """Apply RoPE to input tensor"""
