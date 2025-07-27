@@ -187,22 +187,21 @@ class AdaLNZero(nn.Module):
     
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Args:
-            x: Input features [B, N, C]
-            c: Conditioning features [B, C]
-        Returns:
-            norm_x: Normalized input
-            gates: Modulation parameters (shift, scale, gate_attn, gate_ffn)
+        More torch.compile friendly version
         """
-        # Get modulation parameters
-        mod_params = self.adaLN_modulation(c)
-        shift_mha, scale_mha, gate_mha, shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(6, dim=-1)
+        # Use standard layer norm
+        x_norm = F.layer_norm(x, (self.dim,), self.gamma, self.beta, self.eps)
         
-        # Normalize
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
-        x_norm = (x - mean) / torch.sqrt(var + self.eps)
-        x_norm = x_norm * self.gamma + self.beta
+        # Get modulation parameters using indexing instead of chunk
+        mod_params = self.adaLN_modulation(c)  # [B, 6*dim]
+        
+        # FIX: Use slicing instead of chunk (more compile-friendly)
+        shift_mha = mod_params[:, 0:self.dim]
+        scale_mha = mod_params[:, self.dim:2*self.dim]  
+        gate_mha = mod_params[:, 2*self.dim:3*self.dim]
+        shift_ffn = mod_params[:, 3*self.dim:4*self.dim]
+        scale_ffn = mod_params[:, 4*self.dim:5*self.dim]
+        gate_ffn = mod_params[:, 5*self.dim:6*self.dim]
         
         # Apply modulation for attention
         x_mod = x_norm * (1 + scale_mha.unsqueeze(1)) + shift_mha.unsqueeze(1)
