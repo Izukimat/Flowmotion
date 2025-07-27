@@ -145,9 +145,8 @@ class FlowMatching(nn.Module):
         loss_flf = F.mse_loss(vt_pred[:, :, [0, -1]], torch.zeros_like(vt_pred[:, :, [0, -1]]))
         
         losses = {
-            'loss_velocity': loss_velocity,
-            'loss_flf': loss_flf,
-            'loss_total': loss_velocity + 0.1 * loss_flf
+            'velocity_losss': loss_velocity,
+            'flf_loss': loss_flf,
         }
         
         return losses

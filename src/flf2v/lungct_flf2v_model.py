@@ -30,7 +30,8 @@ class LungCTFLF2V(nn.Module):
         vae: LungCTVAE,
         dit: LungCTDiT,
         flow_matching: FlowMatching,
-        freeze_vae_after: int = 5000
+        freeze_vae_after: int = 5000,
+        loss_weights: Optional[Dict[str, float]] = None
     ):
         super().__init__()
         self.vae = vae
@@ -39,6 +40,15 @@ class LungCTFLF2V(nn.Module):
         self.freeze_vae_after = freeze_vae_after
         self.training_step = 0
         self._vae_frozen = False  # Track if VAE is actually frozen
+        
+        # Configurable loss weights
+        self.loss_weights = loss_weights or {
+            'velocity_weight': 1.0,
+            'flf_weight': 0.1,
+            'vae_recon_weight': 1.0,
+            'vae_kl_weight': 0.01,
+            'vae_temporal_weight': 0.1
+        }
         
     def _freeze_vae(self):
         """Actually freeze VAE parameters"""
@@ -93,35 +103,47 @@ class LungCTFLF2V(nn.Module):
             return_dict=True
         )
         
-        # Extract flow losses with consistent naming
-        flow_losses = {}
-        if 'velocity_loss' in flow_output:
-            flow_losses['loss_velocity'] = flow_output['velocity_loss']
-        if 'flf_loss' in flow_output:
-            flow_losses['loss_flf'] = flow_output['flf_loss']
-        # Add any other flow losses with loss_ prefix
-        for key, value in flow_output.items():
-            if key.endswith('_loss') and key not in ['velocity_loss', 'flf_loss']:
-                flow_losses[f'loss_{key[:-5]}'] = value
+        # Extract flow losses with consistent naming (Improvement 1)
+        flow_losses = {
+            f'loss_{k.replace("_loss", "")}': v 
+            for k, v in flow_output.items() 
+            if k.endswith('_loss') and isinstance(v, torch.Tensor)
+        }
         
         # VAE losses - Fix: only compute if VAE not frozen
         vae_losses = {}
         if self.training_step < self.freeze_vae_after and not self._vae_frozen:
             vae_output = self.vae(video, return_dict=True)
-            if 'loss_recon' in vae_output:
-                vae_losses['loss_vae_recon'] = vae_output['loss_recon']
-            if 'loss_kl' in vae_output:
-                vae_losses['loss_vae_kl'] = vae_output['loss_kl']
-            if 'loss_temporal' in vae_output:
-                vae_losses['loss_vae_temporal'] = vae_output['loss_temporal']
+            
+            # Map VAE loss keys with fallbacks (Improvement 2)
+            vae_loss_mapping = {
+                'loss_recon': 'loss_vae_recon',
+                'loss_kl': 'loss_vae_kl', 
+                'loss_temporal': 'loss_vae_temporal',
+                # Add fallback mappings for different VAE implementations
+                'recon_loss': 'loss_vae_recon',
+                'kl_loss': 'loss_vae_kl',
+                'temporal_loss': 'loss_vae_temporal'
+            }
+            
+            for vae_key, mapped_key in vae_loss_mapping.items():
+                if vae_key in vae_output and isinstance(vae_output[vae_key], torch.Tensor):
+                    vae_losses[mapped_key] = vae_output[vae_key]
+                    
         elif self.training_step >= self.freeze_vae_after and not self._vae_frozen:
             # Freeze VAE parameters
             self._freeze_vae()
         
-        self.training_step += 1
+        # Only increment training step during training (Improvement 4)
+        if self.training:
+            self.training_step += 1
         
         # Combine all losses
         all_losses = {**flow_losses, **vae_losses}
+        
+        # Calculate weighted total loss
+        total_loss = self._calculate_total_loss(all_losses)
+        all_losses['loss_total'] = total_loss
         
         if return_dict:
             # Fix: separate losses from latents to prevent pollution
@@ -137,10 +159,78 @@ class LungCTFLF2V(nn.Module):
             }
             return result
         else:
-            # Return sum of only loss values
-            total_loss = sum(loss for loss in all_losses.values() if isinstance(loss, torch.Tensor))
+            # Return total loss
             return total_loss
+
+    def _calculate_total_loss(self, loss_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Calculate weighted total loss from individual loss components
+        
+        Args:
+            loss_dict: Dictionary containing individual losses
+            
+        Returns:
+            Weighted total loss tensor
+        """
+        if not loss_dict:
+            # Return zero tensor on appropriate device
+            device = next(self.parameters()).device
+            return torch.tensor(0.0, device=device)
+        
+        # Get device from first tensor in loss_dict
+        device = next(iter(loss_dict.values())).device
+        total_loss = torch.tensor(0.0, device=device)
+        
+        # Only sum keys that start with 'loss_'
+        for key, value in loss_dict.items():
+            if key.startswith('loss_'):
+                # Improved: handle different value types (Improvement 6)
+                if isinstance(value, torch.Tensor):
+                    loss_tensor = value
+                elif isinstance(value, (int, float)):
+                    loss_tensor = torch.tensor(float(value), device=device)
+                else:
+                    continue  # Skip non-numeric values
+                
+                # Map loss key to weight key
+                weight = self._get_loss_weight(key)
+                total_loss = total_loss + weight * loss_tensor
+        
+        return total_loss
     
+    def _get_loss_weight(self, loss_key: str) -> float:
+        """Get the appropriate weight for a loss key"""
+        weight_mapping = {
+            'loss_velocity': 'velocity_weight',
+            'loss_flf': 'flf_weight',
+            'loss_vae_recon': 'vae_recon_weight',
+            'loss_vae_kl': 'vae_kl_weight',
+            'loss_vae_temporal': 'vae_temporal_weight'
+        }
+        
+        weight_key = weight_mapping.get(loss_key)
+        if weight_key and weight_key in self.loss_weights:
+            return self.loss_weights[weight_key]
+        else:
+            return 1.0  # Default weight for unknown losses
+    
+    def state_dict(self, *args, **kwargs):
+        """Include _vae_frozen state in checkpoint (Improvement 3)"""
+        state = super().state_dict(*args, **kwargs)
+        state['_vae_frozen'] = self._vae_frozen
+        state['training_step'] = self.training_step
+        return state
+    
+    def load_state_dict(self, state_dict, strict=True):
+        """Restore _vae_frozen state from checkpoint (Improvement 3)"""
+        # Extract custom state before loading
+        if '_vae_frozen' in state_dict:
+            self._vae_frozen = state_dict.pop('_vae_frozen')
+        if 'training_step' in state_dict:
+            self.training_step = state_dict.pop('training_step')
+            
+        return super().load_state_dict(state_dict, strict)
+
     @torch.no_grad()
     def generate(
         self,
