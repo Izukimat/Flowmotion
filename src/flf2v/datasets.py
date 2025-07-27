@@ -25,7 +25,7 @@ class LungCTDataset(Dataset):
         self,
         csv_file: str,
         split: str = 'train',
-        data_root: str = '/home/ragenius_admin/azureblob/4D-Lung-Interpolated/data/',
+        data_root: str = '/home/ubuntu/azureblob/4D-Lung-Interpolated/data/',
         augment: bool = True,
         normalize: bool = True,
         load_input_frames: bool = True,

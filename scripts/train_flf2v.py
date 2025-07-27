@@ -277,7 +277,7 @@ def main():
     parser.add_argument('--config', type=str, required=True, help='Config file path')
     parser.add_argument('--csv-file', type=str, required=True, help='CSV metadata file')
     parser.add_argument('--data-root', type=str, 
-                      default='/home/ragenius_admin/azureblob/4D-Lung-Interpolated/data/',
+                      default='/home/ubuntu/azureblob/4D-Lung-Interpolated/data/',
                       help='Root data directory')
     parser.add_argument('--output-dir', type=str, default='./outputs', help='Output directory')
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')

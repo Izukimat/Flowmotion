@@ -3,6 +3,7 @@
 # Uses 2-D MedVAE (medvae_8x1_2d) and the large DiT in configs/config_h100_2d.yaml
 
 set -e  # exit on first error
+set -o pipefail          # ← propagate errors through pipes
 
 # ───────── Environment ──────────────────────────────────────────────
 export CUDA_VISIBLE_DEVICES=0                       # pick the H100
@@ -32,19 +33,26 @@ echo "  Output dir   : $OUTPUT_DIR"
 
 # ───────── Train ────────────────────────────────────────────────────
 python scripts/train_flf2v.py \
-    --config        configs/config_h100_2d.yaml \
-    --data-dir      "$DATA_DIR" \
-    --csv-file      "$METADATA_CSV" \
-    --output-dir    "$OUTPUT_DIR" \
-    --wandb-project lungct-flf2v \
-    --wandb-run     "h100_${STAMP}" \
-    --num-workers   8 \
+    --config configs/config_h100_2d.yaml \
+    --csv-file $METADATA_CSV \
+    --output-dir $OUTPUT_DIR \
+    --wandb-project lungct-flf2v-numpy \
+    --wandb-run "h100_numpy_$(date +%Y%m%d_%H%M%S)" \
+    --num-workers 24 \
     --prefetch-factor 4 \
-    2>&1 | tee "$OUTPUT_DIR/training.log"
+    2>&1 | tee $OUTPUT_DIR/training.log
 
-STATUS=$?
-if [ $STATUS -eq 0 ]; then
-  echo "✓ Training completed. Artifacts in $OUTPUT_DIR"
+
+# Check if training completed successfully
+if [ $? -eq 0 ]; then
+    echo "Training completed successfully! Results saved to $OUTPUT_DIR"
+    echo ""
+    echo "Output files:"
+    echo "  - Training log: $OUTPUT_DIR/training.log"
+    echo "  - Config: $OUTPUT_DIR/config_h100_2d.yaml"
+    echo "  - Checkpoints: $OUTPUT_DIR/checkpoint_*.pt"
+    echo "  - Final model: $OUTPUT_DIR/final_model.pt"
 else
-  echo "✗ Training failed — see $OUTPUT_DIR/training.log"
+    echo "Training failed! Check the log for details: $OUTPUT_DIR/training.log"
+    exit 1
 fi
