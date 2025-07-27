@@ -494,7 +494,7 @@ class LungCTDiT(nn.Module):
         x = self.proj_out(x)
         
         # Reshape back
-        x = rearrange(x, 'b (d h w) c -> b c d h w', d=D, h=H, w=W)
+        x = rearrange(x, 'b (d h w) c -> b c d h w', d=D, h=H//2, w=W//2) 
         
         return x
 
