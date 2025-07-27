@@ -151,7 +151,7 @@ def train_epoch(
         B, C, T, H, W = video.shape
         
         # Forward pass with autocast
-        with torch.amp.autocast(device_type='cuda'):
+        with torch.amp.autocast(device_type='cuda',dtype=torch.bfloat16):
             # Get all losses from the model
             all_losses = model_ref(
                 video=video,
@@ -257,7 +257,7 @@ def validate_epoch(
             B, C, T, H, W = video.shape
             
             # Forward pass
-            with torch.amp.autocast(device_type='cuda'):
+            with torch.amp.autocast(device_type='cuda',dtype=torch.bfloat16):
                 all_losses = model_ref(
                     video=video,
                     return_dict=True
