@@ -134,9 +134,10 @@ class FlowMatching(nn.Module):
         # )
         
         if vt_pred.shape != vt_target.shape:
-            vt_target = F.interpolate(
-                vt_target, size=vt_pred.shape[-2:], mode="bilinear", align_corners=False
-            )
+            B, C, D, H, W = vt_target.shape
+            vt_target = vt_target.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+            vt_target = F.interpolate(vt_target, size=vt_pred.shape[-2:], mode="bilinear", align_corners=False)
+            vt_target = vt_target.reshape(B, D, C, *vt_pred.shape[-2:]).permute(0, 2, 1, 3, 4)
         # MSE loss on velocity
         loss_velocity = F.mse_loss(vt_pred * loss_weight, vt_target * loss_weight)
         
