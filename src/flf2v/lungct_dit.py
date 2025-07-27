@@ -5,6 +5,8 @@ Based on Wan2.1 architecture but adapted for medical imaging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
 import numpy as np
 import math
 from typing import Optional, Tuple, List, Dict
@@ -245,8 +247,8 @@ class DiTBlock(nn.Module):
         # Normalization and modulation
         self.norm1 = AdaLNZero(dim)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-
-    def forward(
+    
+    def _forward(
         self, 
         x: torch.Tensor, 
         c: torch.Tensor,
@@ -276,7 +278,12 @@ class DiTBlock(nn.Module):
         x = x + gate_ffn.unsqueeze(1) * x_ffn
         
         return x
-
+    
+    def forward(self, x, c, spatial_shape):
+        if self.training:
+            return checkpoint(self._forward_block, x, c, spatial_shape)
+        else:
+            return self._forward_block(x, c, spatial_shape)
 
 class FLF2VConditioning(nn.Module):
     """
@@ -364,7 +371,7 @@ class LungCTDiT(nn.Module):
         self.latent_size = latent_size
         self.hidden_dim = hidden_dim
         self.num_tokens = np.prod(latent_size)
-        self.patch_merge = PatchMerging3D(hidden_dim, down=(1,4,4))
+        self.patch_merge = PatchMerging3D(hidden_dim, down=(1,2,2))
         _, self.H, self.W = latent_size 
 
         # Patchify projection (1x1x1 conv)
