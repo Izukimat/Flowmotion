@@ -56,11 +56,12 @@ training:
   warmup_epochs: 3
 
   # ───────── Batch / precision settings for H100-80 GB ───────────────
-  batch_size: 1                     # per GPU (8×40×128² fits with fp16)
-  gradient_accumulation_steps: 4
+  batch_size: 4                     # per GPU (8×40×128² fits with fp16)
+  gradient_accumulation_steps: 1
   mixed_precision: true             # fp16 + bfloat16 automatically on H100
-  gradient_checkpointing: true    # not needed – plenty of VRAM
-
+  gradient_checkpointing: false    # not needed – plenty of VRAM
+  compile_model: true 
+  
 data:
   # Input is a *single* axial slice time-series → 2-D VAE
   num_frames: 82

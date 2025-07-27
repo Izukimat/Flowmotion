@@ -375,6 +375,33 @@ def main():
     
     # Create model
     model = create_model(config, device)
+    if config['training'].get('compile_model', True):
+        logging.info("🚀 Compiling model components for H100...")
+        
+        # Get model reference (before potential DDP wrapping)
+        model_ref = model
+        
+        # Compile the most compute-intensive component (DiT)
+        try:
+            model_ref.dit = torch.compile(
+                model_ref.dit,
+                mode='max-autotune',  # Best for H100
+                fullgraph=True
+            )
+            logging.info("✅ DiT compiled successfully")
+        except Exception as e:
+            logging.warning(f"⚠️ DiT compilation failed: {e}, proceeding without compilation")
+        
+        # Optionally compile VAE components (more conservative)
+        try:
+            if hasattr(model_ref.vae, 'encoder'):
+                model_ref.vae.encoder = torch.compile(model_ref.vae.encoder, mode='default')
+            if hasattr(model_ref.vae, 'decoder'):
+                model_ref.vae.decoder = torch.compile(model_ref.vae.decoder, mode='default')
+            logging.info("✅ VAE components compiled successfully")
+        except Exception as e:
+            logging.warning(f"⚠️ VAE compilation failed: {e}, proceeding without compilation")
+            
     if args.distributed:
         model = DDP(model, device_ids=[local_rank])
     
