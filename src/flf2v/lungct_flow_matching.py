@@ -251,13 +251,21 @@ class FlowMatching(nn.Module):
         """Forward pass computes loss during training"""
         return self.compute_loss(x1, first_frame, last_frame, dit_model, frozen_mask)
 
-
 def create_flow_matching_model(config: Optional[Dict] = None) -> FlowMatching:
     """
     Factory function to create flow matching model
     """
     if config and 'config' in config:
-        fm_config = FlowMatchingConfig(**config['config'])
+        # Fix: Convert string values to proper types
+        config_dict = config['config'].copy()
+        if 'sigma_min' in config_dict:
+            config_dict['sigma_min'] = float(config_dict['sigma_min'])
+        if 'num_sampling_steps' in config_dict:
+            config_dict['num_sampling_steps'] = int(config_dict['num_sampling_steps'])
+        if 'guidance_scale' in config_dict:
+            config_dict['guidance_scale'] = float(config_dict['guidance_scale'])
+        
+        fm_config = FlowMatchingConfig(**config_dict)
     else:
         fm_config = FlowMatchingConfig(**(config or {}))
     
