@@ -120,7 +120,7 @@ class FlowMatching(nn.Module):
             loss_weight = 1.0
         elif self.config.loss_weighting == "velocity":
             # Weight by velocity magnitude
-            loss_weight = torch.norm(vt_target.view(B, -1), dim=1, keepdim=True)
+            loss_weight = torch.norm(vt_target.reshape(B, -1), dim=1, keepdim=True)
             loss_weight = loss_weight.view(-1, 1, 1, 1, 1)
         elif self.config.loss_weighting == "truncated":
             # Truncated weighting for stability
