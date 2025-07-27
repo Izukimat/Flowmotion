@@ -248,7 +248,7 @@ class DiTBlock(nn.Module):
         self.norm1 = AdaLNZero(dim)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
     
-    def _forward(
+    def _forward_block(
         self, 
         x: torch.Tensor, 
         c: torch.Tensor,
