@@ -25,6 +25,13 @@ class WindowedSelfAttention(nn.Module):
         self.qkv  = nn.Linear(dim, 3 * num_heads * head_dim, bias=False)
         self.proj = nn.Linear(num_heads * head_dim, dim)
 
+    def patchify_and_merge(self, x_latent):
+        """latent [B,C,1,H,W] → tokens [B, H′·W′, C] after 1× merge"""
+        x = self.patchify(x_latent)                       # [B,C,1,H′,W′]
+        x = rearrange(x, 'b c t h w -> b (t h w) c')      # flatten
+        x, _ = self.patch_merge(x, (1, self.H, self.W))   # same merge
+        return x
+
     def forward(self, x, shape):
         """
         x : [B, N, C]  – flattened tokens
@@ -245,7 +252,7 @@ class DiTBlock(nn.Module):
         # Normalization and modulation
         self.norm1 = AdaLNZero(dim)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-    
+
     def forward(
         self, 
         x: torch.Tensor, 
@@ -372,12 +379,6 @@ class LungCTDiT(nn.Module):
             kernel_size=1, stride=1, padding=0
         )
         
-        # FLF2V conditioning
-        self.flf_conditioning = FLF2VConditioning(
-            latent_channels,
-            hidden_dim
-        )
-        
         # Timestep embedding
         self.time_embed = nn.Sequential(
             SinusoidalPosEmb(hidden_dim),
@@ -463,12 +464,13 @@ class LungCTDiT(nn.Module):
             frozen_mask[:, 0] = 1
             frozen_mask[:, -1] = 1
         
-        flf_cond, mask_cond = self.flf_conditioning(first_frame, last_frame, frozen_mask)
-        
+        first_tok  = self.patchify_and_merge(first_frame)
+        last_tok   = self.patchify_and_merge(last_frame)
+        flf_cond   = torch.cat([first_tok, last_tok], dim=1)   # [B, 2·H′·W′, C]       
         # Combine conditioning
         # Option 1: Add FLF conditioning as extra tokens
         x = torch.cat([flf_cond, x], dim=1)
-        
+        spatial_shape = (D + 2, H//2, W//2)
         # Apply transformer blocks
         for block in self.blocks:
             x = block(x, t_emb, spatial_shape=spatial_shape)
