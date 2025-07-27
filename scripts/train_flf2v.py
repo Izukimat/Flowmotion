@@ -150,25 +150,11 @@ def train_epoch(
         # Extract first and last frames from the video sequence
         B, C, T, H, W = video.shape
         
-        # For FLF2V, we need first and last frames
-        # Option 1: Use actual first and last frames
-        first_frame = video[:, :, 0:1, :, :]    # [B, 1, 1, H, W]
-        last_frame = video[:, :, -1:, :, :]     # [B, 1, 1, H, W]
-        
-        # Option 2: If input_frames exist, use those instead (they're the original 10 frames)
-        if 'input_frames' in batch:
-            input_frames = batch['input_frames'].to(device)  # [B, 1, 10, H, W]
-            # Use frame 0 and frame 9 from the original frames
-            first_frame = input_frames[:, :, 0:1, :, :]   # [B, 1, 1, H, W]
-            last_frame = input_frames[:, :, -1:, :, :]    # [B, 1, 1, H, W]
-        
         # Forward pass with autocast
         with autocast():
             # Get all losses from the model
             all_losses = model_ref(
-                first_frame=first_frame,
-                last_frame=last_frame,
-                target_frames=video,
+                video=video,
                 return_dict=True
             )
             
@@ -270,22 +256,10 @@ def validate_epoch(
             
             B, C, T, H, W = video.shape
             
-            # Extract frames
-            first_frame = video[:, :, 0:1, :, :]
-            last_frame = video[:, :, -1:, :, :]
-            
-            # Use original frames if available
-            if 'input_frames' in batch:
-                input_frames = batch['input_frames'].to(device)
-                first_frame = input_frames[:, :, 0:1, :, :]
-                last_frame = input_frames[:, :, -1:, :, :]
-            
             # Forward pass
             with autocast():
                 all_losses = model_ref(
-                    first_frame=first_frame,
-                    last_frame=last_frame,
-                    target_frames=video,
+                    video=video,
                     return_dict=True
                 )
                 
