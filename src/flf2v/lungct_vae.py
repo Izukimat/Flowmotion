@@ -26,120 +26,79 @@ class LungCTVAE(nn.Module):
     
     def __init__(
         self,
-        base_model_name: str = "medvae_4_1_3d",  # 4x compression per dim = 64x total
-        latent_channels: int = 8,  # Increased from 1 for better expressiveness
-        temporal_weight: float = 0.1,
-        use_tanh_scaling: bool = True,
-        freeze_pretrained: bool = False
+        base_model_name: str = "medvae_8x1_2d",   # 8× down per axis (x64 total)
+        latent_channels:  int  = 8,
+        temporal_weight:  float= 0.1,
+        use_tanh_scaling: bool  = True,
+        freeze_pretrained: bool = False,
     ):
         super().__init__()
-        
-        self.latent_channels = latent_channels
-        self.temporal_weight = temporal_weight
-        self.use_tanh_scaling = use_tanh_scaling
-        
-        # Load pretrained MedVAE 3D model
+        self.latent_channels   = latent_channels
+        self.temporal_weight   = temporal_weight
+        self.use_tanh_scaling  = use_tanh_scaling
+        self.compression_factor= 8                # 8× in H and W (no temporal downsampling)
+
+        # ───────────────────────────────── MedVAE backbone (2-D) ────────────
         self.base_vae = create_model(base_model_name, training=True, state_dict=True)
-        
-        # Get config from base model
-        self.compression_factor = 4  # 4x per dimension
-        base_latent_dim = self.base_vae.embed_dim  # Usually matches conv output
-        
-        # Adapt for increased channels: add projection layers
+
+        # optional 1→N channel expansion
         if latent_channels != 1:
-            # Two options for channel expansion:
-            # Option 1: Learned projection (current implementation)
-            self.channel_expansion = nn.Conv3d(
-                1, latent_channels, 
-                kernel_size=1, stride=1, padding=0
-            )
-            
-            # Option 2: Simple repetition (uncomment to use)
-            # self.channel_expansion = lambda x: x.repeat(1, latent_channels, 1, 1, 1)
-            
-            # Project from N channels back to 1 before decoding
-            self.channel_reduction = nn.Conv3d(
-                latent_channels, 1,
-                kernel_size=1, stride=1, padding=0
-            )
-            
-            # Initialize with identity-like mapping
-            if isinstance(self.channel_expansion, nn.Conv3d):
-                nn.init.xavier_uniform_(self.channel_expansion.weight, gain=1.0)
-                nn.init.zeros_(self.channel_expansion.bias)
-            nn.init.xavier_uniform_(self.channel_reduction.weight, gain=1.0)
-            nn.init.zeros_(self.channel_reduction.bias)
-        
-        # Tanh scaling parameters (learnable)
+            self.channel_exp = nn.Conv2d(1, latent_channels, 1)
+            self.channel_red = nn.Conv2d(latent_channels, 1, 1)
+            nn.init.xavier_uniform_(self.channel_exp.weight);   nn.init.zeros_(self.channel_exp.bias)
+            nn.init.xavier_uniform_(self.channel_red.weight);   nn.init.zeros_(self.channel_red.bias)
+
         if use_tanh_scaling:
             self.latent_scale = nn.Parameter(torch.ones(1))
             self.latent_shift = nn.Parameter(torch.zeros(1))
-        
-        # Optionally freeze pretrained weights
+
         if freeze_pretrained:
-            for param in self.base_vae.parameters():
-                param.requires_grad = False
-    
+            for p in self.base_vae.parameters(): p.requires_grad = False
+
+    # ───────────────────────────── helper: encode one 2-D frame ─────────────
+    def _encode_2d(self, x2d: torch.Tensor):
+        post = self.base_vae.encode(x2d)
+        mu, logvar = post.mean, post.logvar
+        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+        return z, mu, logvar
+
+    # ───────────────────────────────────────── public API ───────────────────
     def encode(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Encode lung CT volume to latent representation
-        Args:
-            x: Input tensor [B, 1, D, H, W] in range [-1, 1]
-        Returns:
-            dict with 'latent', 'mu', 'logvar', 'mu_expanded', 'logvar_expanded'
+        x : [B, 1, T, H, W]  (pixel domain, −1…1)
+        returns latents  [B, C, T, H/8, W/8]
         """
-        # Use base VAE encoder
-        posterior = self.base_vae.encode(x)
-        mu, logvar = posterior.mean, posterior.logvar
-        
-        # Sample latent
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z = mu + eps * std
-        
-        # Store original mu/logvar for KL computation
-        mu_original = mu
-        logvar_original = logvar
-        
-        # Expand channels if needed
+        B, _, T, H, W = x.shape
+        x2d = x.permute(0,2,1,3,4).reshape(B*T, 1, H, W)        # (B·T,1,H,W)
+
+        z, mu, logvar = self._encode_2d(x2d)                     # (B·T,1,h,w)
         if self.latent_channels != 1:
-            z = self.channel_expansion(z)
-            # For flow matching, we only need the expanded z
-            # We do NOT expand mu/logvar as that breaks the probabilistic interpretation
-        
-        # Apply tanh scaling for zero-mean unit-var
+            z = self.channel_exp(z)
+
         if self.use_tanh_scaling:
             z = torch.tanh(z * self.latent_scale + self.latent_shift)
-        
-        return {
-            'latent': z,
-            'mu': mu_original,  # Keep original for KL
-            'logvar': logvar_original,  # Keep original for KL
-            'z_pre_tanh': z if not self.use_tanh_scaling else None
-        }
-    
+
+        h, w = z.shape[-2:]
+        z = z.view(B, T, self.latent_channels, h, w).permute(0,2,1,3,4)  # (B,C,T,h,w)
+        mu = mu.view(B, T, 1, h, w).permute(0,2,1,3,4)
+        logvar = logvar.view(B, T, 1, h, w).permute(0,2,1,3,4)
+
+        return {"latent": z, "mu": mu, "logvar": logvar}
+
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Decode latent to reconstructed volume
-        Args:
-            z: Latent tensor [B, C, D', H', W']
-        Returns:
-            Reconstructed volume [B, 1, D, H, W]
-        """
-        # Inverse tanh scaling
+        B, C, T, h, w = z.shape
         if self.use_tanh_scaling:
-            # Clamp to avoid inf in atanh
-            z = torch.clamp(z, -0.999, 0.999)
-            z = (torch.atanh(z) - self.latent_shift) / self.latent_scale
-        
-        # Reduce channels if needed
+            z = torch.atanh(torch.clamp(z, -0.999, 0.999))
+            z = (z - self.latent_shift) / self.latent_scale
+
         if self.latent_channels != 1:
-            z = self.channel_reduction(z)
-        
-        # Use base VAE decoder
-        x_recon = self.base_vae.decode(z)
-        
-        return x_recon
+            z = self.channel_red(z)
+
+        z2d = z.permute(0,2,1,3,4).reshape(B*T, 1, h, w)
+        recon2d = self.base_vae.decode(z2d)                      # (B·T,1,H,W)
+        H, W = recon2d.shape[-2:]
+        recon = recon2d.view(B, T, 1, H, W).permute(0,2,1,3,4)   # (B,1,T,H,W)
+        return recon
     
     def forward(
         self, 
