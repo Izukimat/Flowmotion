@@ -51,7 +51,8 @@ class LungCTFLF2V(nn.Module):
     
     def encode_frames(self, frames: torch.Tensor) -> torch.Tensor:
         """Encode frames to latent space"""
-        return self.vae.encode(frames)
+        vae_output = self.vae.encode(frames)
+        return vae_output["latent"]
     
     def decode_frames(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode latents to frame space"""
