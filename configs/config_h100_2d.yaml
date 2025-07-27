@@ -11,7 +11,7 @@ model:
   vae_base_model: 'medvae_8_1_2d'     # 8× compression per spatial axis (=64× pixel-count)
   latent_channels: 8                  # 1 → 8 channel expansion inside wrapper
   vae_temporal_weight: 0.1
-  freeze_vae_after: 5_000            # fine-tune a few k steps, then freeze
+  freeze_vae_after: 5000            # fine-tune a few k steps, then freeze
 
   # ───────── DiT (backbone) ───────────────────────────────────────────
   dit_config:
