@@ -37,7 +37,7 @@ class LungCTVAE(nn.Module):
         self.temporal_weight   = temporal_weight
         self.use_tanh_scaling  = use_tanh_scaling
         self.compression_factor= 8                # 8× in H and W (no temporal downsampling)
-
+        self._vae_frozen = False
         # ───────────────────────────────── MedVAE backbone (2-D) ────────────
         self.base_vae = create_model(base_model_name, training=True, state_dict=True)
 

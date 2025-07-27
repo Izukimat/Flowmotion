@@ -46,6 +46,7 @@ class LungCTFLF2V(nn.Module):
             for param in self.vae.parameters():
                 param.requires_grad = False
             self._vae_frozen = True
+            self.vae._vae_frozen = True
             logging.info(f"VAE parameters frozen at step {self.training_step}")
     
     def encode_frames(self, frames: torch.Tensor) -> torch.Tensor:
