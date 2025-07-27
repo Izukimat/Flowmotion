@@ -159,7 +159,7 @@ def train_epoch(
             )
             
             # Extract individual losses
-            total_loss = all_losses['total']
+            total_loss = all_losses['loss_total']
             
             # Record losses
             for key, value in all_losses.items():
