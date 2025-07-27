@@ -57,87 +57,13 @@ class LungCTDataset(Dataset):
         self.df = self.df.reset_index(drop=True)
         
         # Build sample list with verified paths
-        self.samples = self._build_samples()
-        
-        logging.info(
-            f"Loaded {len(self.samples)} samples for {split} split"
-            + (f" with phase filter {phase_filter}" if phase_filter else "")
-            + (f" with experiment filter {experiment_filter}" if experiment_filter else "")
-        )
-    
-    def _build_samples(self) -> List[Dict]:
-        """Build list of samples with verified file paths"""
-        samples = []
-        
-        for _, row in self.df.iterrows():
-            # Construct paths - Fix: ensure slice_num is int for formatting
-            sample_dir = (
-                self.data_root / 
-                row['patient_id'] / 
-                row['experiment_id'] / 
-                row['series_id'] / 
-                f"slice_{int(row['slice_num']):04d}" /  # Fix: cast to int
-                f"phase_{row['phase_range']}"
-            )
-            
-            input_path = sample_dir / 'input_frames.npy'
-            target_path = sample_dir / 'target_frames.npy'
-            metadata_path = sample_dir / 'metadata.json'
-            
-            # Verify required files exist
-            files_exist = True
-            if self.load_input_frames and not input_path.exists():
-                files_exist = False
-            if self.load_target_frames and not target_path.exists():
-                files_exist = False
-            
-            if files_exist:
-                sample = {
-                    'patient_id': row['patient_id'],
-                    'experiment_id': row['experiment_id'],
-                    'series_id': row['series_id'],
-                    'slice_num': int(row['slice_num']),  # Ensure int type
-                    'phase_range': row['phase_range'],
-                    'sample_dir': sample_dir,
-                    'input_path': input_path,
-                    'target_path': target_path,
-                    'metadata_path': metadata_path,
-                    'split': row['split']
-                }
-                
-                # Load metadata if available
-                if metadata_path.exists():
-                    try:
-                        with open(metadata_path, 'r') as f:
-                            sample['metadata'] = json.load(f)
-                    except Exception as e:
-                        logging.warning(f"Error loading metadata from {metadata_path}: {e}")
-                        sample['metadata'] = {}
-                else:
-                    sample['metadata'] = {}
-                
-                samples.append(sample)
-            else:
-                logging.warning(f"Missing required files in {sample_dir}")
-        
-        return samples
+        self.samples = self.df.to_dict(orient="records")
+        logging.info(f"Loaded manifest with {len(self.samples)} {split} samples")
     
     def _load_numpy_files(self, sample: Dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Load NumPy arrays for a sample"""
-        input_frames = None
-        target_frames = None
-        
-        try:
-            if self.load_input_frames:
-                input_frames = np.load(sample['input_path'])  # Shape: (10, 512, 512)
-            
-            if self.load_target_frames:
-                target_frames = np.load(sample['target_path'])  # Shape: (82, 512, 512)
-                
-        except Exception as e:
-            logging.error(f"Error loading NumPy files from {sample['sample_dir']}: {e}")
-            raise
-        
+        input_frames  = np.load(sample["input_path"])  if self.load_input_frames  else None
+        target_frames = np.load(sample["target_path"]) if self.load_target_frames else None
         return input_frames, target_frames
     
     def _normalize_frames(self, frames: np.ndarray) -> np.ndarray:
