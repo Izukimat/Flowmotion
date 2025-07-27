@@ -19,7 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
@@ -151,7 +151,7 @@ def train_epoch(
         B, C, T, H, W = video.shape
         
         # Forward pass with autocast
-        with autocast():
+        with torch.amp.autocast():
             # Get all losses from the model
             all_losses = model_ref(
                 video=video,
@@ -257,7 +257,7 @@ def validate_epoch(
             B, C, T, H, W = video.shape
             
             # Forward pass
-            with autocast():
+            with torch.amp.autocast():
                 all_losses = model_ref(
                     video=video,
                     return_dict=True

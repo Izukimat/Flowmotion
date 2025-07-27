@@ -255,9 +255,15 @@ class FLF2VConditioning(nn.Module):
         frames_feat = self.frame_proj(frames_concat)
         
         # Add positional embeddings
-        pos_emb = repeat(self.pos_emb, '1 2 c -> b n c', b=B, n=frames_feat.shape[1])
-        frames_feat = frames_feat + pos_emb[:, 0] # Use first position
-        
+        pos_emb = repeat(
+            self.pos_emb[:, 0],      # [1, C]
+            '1 c -> b n c',          # broadcast to every token
+            b=B,
+            n=frames_feat.shape[1]
+        )
+
+        frames_feat = frames_feat + pos_emb          # shape  [B, N, C]
+                
         # Add mask embeddings
         mask_feat = self.mask_emb(frozen_mask.long())
         
