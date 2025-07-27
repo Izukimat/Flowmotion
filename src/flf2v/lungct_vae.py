@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 import numpy as np
-from medvae.models import AutoencoderKL_3D
 from medvae.utils.factory import create_model
 
 

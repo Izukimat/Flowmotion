@@ -9,7 +9,7 @@ model:
   # DiT settings - scaled down for V100
   dit_config:
     latent_channels: 8
-    latent_size: [10, 32, 32]  # After 8x compression of 82x512x512
+    latent_size: [6, 32, 32]  # After 8x compression of 82x512x512
     hidden_dim: 512  # Reduced from 768 for V100
     depth: 12  # Reduced from 24
     num_heads: 8
@@ -49,7 +49,7 @@ training:
   batch_size: 1  # Per GPU
   gradient_accumulation_steps: 4  # Effective batch size of 4
   mixed_precision: true
-  gradient_checkpointing: false  # Disabled for memory saving
+  gradient_checkpointing: true  # Disabled for memory saving
   
   # Scheduler settings
   scheduler_type: 'cosine'  # 'cosine', 'linear', or 'constant'
@@ -57,7 +57,7 @@ training:
 
 data:
   # Data settings - Updated for NumPy array structure
-  num_frames: 82  # Full interpolated sequence length from target_frames.npy
+  num_frames: 42  # Full interpolated sequence length from target_frames.npy
   input_frames: 10  # Number of input frames from input_frames.npy
   target_size: [512, 512, 82]  # [H, W, T] - actual data dimensions
   
@@ -73,7 +73,7 @@ data:
     enable_augmentation: true  # Enable during training
   
   # Phase range settings - for full breathing cycle
-  phase_range: '0-100'  # Full breathing cycle (no filtering)
+  phase_range: '0-50'  # Full breathing cycle (no filtering)
   
   # Experiment filtering (optional - can filter specific interpolation methods)
   # experiment_filter: ['hfr_optical_flow_8fps', 'hfr_linear_8fps']  # Uncomment to filter

@@ -150,6 +150,8 @@ def train_epoch(
         else:
             raise ValueError("No video data found in batch")
         
+        print(f"debug batch shape: {video.shape}")   # expect [B, C, 42, 512, 512]
+
         # Forward pass with mixed precision
         with autocast():
             # Train the model on full breathing sequence
