@@ -30,19 +30,24 @@ class RoPE3D(nn.Module):
         self._build_cache()
     
     def _build_cache(self):
-        positions = torch.arange(self.max_seq_len, dtype=torch.float, device=self.inv_freq.device)
-        freqs = torch.einsum("i,j->ij", positions, self.inv_freq)
-        cos = freqs.cos().repeat_interleave(2, dim=-1)  # shape = [L, dim]
-        sin = freqs.sin().repeat_interleave(2, dim=-1)  # shape = [L, dim]
-        self.register_buffer("cos_cache", cos)
-        self.register_buffer("sin_cache", sin)
+        with torch.no_grad():                 # avoid autograd tracking
+            positions = torch.arange(
+                self.max_seq_len, dtype=torch.float, device=self.inv_freq.device
+            )
+            freqs = torch.einsum("i,j->ij", positions, self.inv_freq)
+            cos = freqs.cos().repeat_interleave(2, dim=-1)
+            sin = freqs.sin().repeat_interleave(2, dim=-1)
+        self.register_buffer("cos_cache", cos, persistent=False)
+        self.register_buffer("sin_cache", sin, persistent=False)
     
     def forward(self, x: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
         """Apply RoPE to input tensor"""
         seq_len = x.shape[seq_dim]
         
+        # Rebuild cache if the current one is too small
         if seq_len > self.max_seq_len:
-            self._build_cache()
+            self.max_seq_len = int(seq_len)          # <- update the limit
+            self._build_cache()                      #    rebuild cos/sin
         
         cos = self.cos_cache[:seq_len]
         sin = self.sin_cache[:seq_len]
