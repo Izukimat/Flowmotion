@@ -364,7 +364,7 @@ class LungCTDiT(nn.Module):
         self.latent_size = latent_size
         self.hidden_dim = hidden_dim
         self.num_tokens = np.prod(latent_size)
-        self.patch_merge = PatchMerging3D(hidden_dim, down=(1,2,2))
+        self.patch_merge = PatchMerging3D(hidden_dim, down=(1,4,4))
         _, self.H, self.W = latent_size 
 
         # Patchify projection (1x1x1 conv)
