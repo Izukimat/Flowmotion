@@ -418,10 +418,13 @@ class LungCTDiT(nn.Module):
         nn.init.zeros_(self.proj_out.bias)
 
     def patchify_and_merge(self, x_latent):
-        """latent [B,C,1,H,W] → tokens [B, H′·W′, C] after 1× merge"""
-        x = self.patchify(x_latent)                       # [B,C,1,H′,W′]
+        """
+        latent [B,C,1,H,W] → tokens [B, H'·W', C] after 1× merge
+        """
+        x = self.patchify(x_latent)                       # [B,C,1,H',W']
+        B, _, T, H, W = x.shape                          # infer H', W'
         x = rearrange(x, 'b c t h w -> b (t h w) c')      # flatten
-        x, _ = self.patch_merge(x, (1, self.H, self.W))   # same merge
+        x, _ = self.patch_merge(x, (T, H, W))             # merge with correct shape
         return x
     
     def forward(
