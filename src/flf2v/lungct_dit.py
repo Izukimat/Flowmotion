@@ -30,7 +30,7 @@ class RoPE3D(nn.Module):
         self._build_cache()
     
     def _build_cache(self):
-        positions = torch.arange(self.max_seq_len, dtype=torch.float)
+        positions = torch.arange(self.max_seq_len, dtype=torch.float, device=self.inv_freq.device)
         freqs = torch.einsum("i,j->ij", positions, self.inv_freq)
         self.register_buffer("cos_cache", freqs.cos())
         self.register_buffer("sin_cache", freqs.sin())
