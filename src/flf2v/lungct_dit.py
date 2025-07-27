@@ -131,6 +131,11 @@ class DiTBlock(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+         # --- Rotary setup --------------------------------------------------
+        # We usually rotate *half* of the head dimension (LLMs-style).
+        # Feel free to choose any value ≤ head_dim, but it must equal the
+        # dim you give to RoPE3D.
+        self.rotary_dim = self.head_dim // 2      # 48 when head_dim = 96
         
         # Self-attention
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
@@ -154,7 +159,7 @@ class DiTBlock(nn.Module):
         # RoPE
         self.use_rope = use_rope
         if use_rope:
-            self.rope = RoPE3D(self.head_dim)
+            self.rope = RoPE3D(self.rotary_dim)
     
     def forward(
         self, 
@@ -178,10 +183,16 @@ class DiTBlock(nn.Module):
         qkv = self.qkv(x_norm).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         
-        # Apply RoPE if enabled
+        # Apply RoPE to the first rotary_dim features only
         if self.use_rope:
-            q = self.rope(q, seq_dim=2)
-            k = self.rope(k, seq_dim=2)
+            q_rot, q_pass = q[..., :self.rotary_dim], q[..., self.rotary_dim:]
+            k_rot, k_pass = k[..., :self.rotary_dim], k[..., self.rotary_dim:]
+
+            q_rot = self.rope(q_rot, seq_dim=2)
+            k_rot = self.rope(k_rot, seq_dim=2)
+
+            q = torch.cat([q_rot, q_pass], dim=-1)
+            k = torch.cat([k_rot, k_pass], dim=-1)
         
         # Attention
         attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
