@@ -296,7 +296,7 @@ class LungCTDiT(nn.Module):
         
         # FLF2V conditioning
         self.flf_conditioning = FLF2VConditioning(
-            latent_channels * 2,
+            latent_channels,
             hidden_dim
         )
         
