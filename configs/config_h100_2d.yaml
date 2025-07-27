@@ -15,8 +15,8 @@ model:
   # ───────── DiT (backbone) ───────────────────────────────────────────
   dit_config:
     latent_channels: 8
-    latent_size: [82, 64, 64]        # 40 frames, 128×128 → 16×16 after 8× down-sampling
-    hidden_dim: 768
+    latent_size: [82, 32, 32]        # 40 frames, 128×128 → 16×16 after 8× down-sampling
+    hidden_dim: 512
     depth: 20                        # ~1.1 B parameters – H100 can handle it
     num_heads: 8
     mlp_ratio: 4.0

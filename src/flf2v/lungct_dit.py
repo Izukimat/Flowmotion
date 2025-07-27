@@ -11,6 +11,94 @@ from typing import Optional, Tuple, List, Dict
 from einops import rearrange, repeat
 
 
+class WindowedSelfAttention(nn.Module):
+    """
+    Local (T,H,W) window attention for 3-D tokens.
+    """
+    def __init__(self, dim, num_heads=8, window=(8, 8, 8), head_dim=64):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim  = head_dim
+        self.window    = window              # (T, H, W)
+        self.scale     = head_dim ** -0.5
+
+        self.qkv  = nn.Linear(dim, 3 * num_heads * head_dim, bias=False)
+        self.proj = nn.Linear(num_heads * head_dim, dim)
+
+    def forward(self, x, shape):
+        """
+        x : [B, N, C]  – flattened tokens
+        shape : (T, H, W) before flattening
+        """
+        B, N, C = x.shape
+        T, H, W = shape
+        wT, wH, wW = self.window
+
+        # ------------- reshape & pad -----------------
+        x = x.view(B, T, H, W, C)            # -> grid
+        pad_t = (wT - T % wT) % wT
+        pad_h = (wH - H % wH) % wH
+        pad_w = (wW - W % wW) % wW
+        if pad_t or pad_h or pad_w:
+            x = F.pad(x, (0, 0,                    # channels
+                          0, pad_w,                # width
+                          0, pad_h,                # height
+                          0, pad_t))               # depth/time
+        Tp, Hp, Wp = x.shape[1:4]
+
+        # partition windows -> [B * nW, win_size, C]
+        x = x.view(B,
+                   Tp // wT, wT,
+                   Hp // wH, wH,
+                   Wp // wW, wW, C)
+        x = x.permute(0,1,3,5,2,4,6,7).contiguous()
+        x = x.view(-1, wT*wH*wW, C)
+
+        # ------------- attention ---------------------
+        qkv = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = [t.view(t.shape[0], t.shape[1], self.num_heads, self.head_dim
+                          ).transpose(1, 2) for t in qkv]  # [B*nW, H, S, Dh]
+
+        attn  = (q @ k.transpose(-2, -1)) * self.scale
+        attn  = attn.softmax(dim=-1)
+        x_out = (attn @ v).transpose(1, 2).reshape(x.shape[0], x.shape[1],
+                                                   self.num_heads * self.head_dim)
+        x_out = self.proj(x_out)
+
+        # ------------- reverse windows ---------------
+        x_out = x_out.view(B,
+                           Tp // wT, Hp // wH, Wp // wW,
+                           wT, wH, wW, C)
+        x_out = x_out.permute(0,1,4,2,5,3,6,7).contiguous()
+        x_out = x_out.view(B, Tp, Hp, Wp, C)[:, :T, :H, :W]  # drop pad
+        return x_out.view(B, N, C)        # flatten back
+
+# -------------------------------------------------------------------
+
+class PatchMerging3D(nn.Module):
+    """
+    Down-samples (T,H,W) by (dT,dH,dW) with linear projection.
+    """
+    def __init__(self, dim, down=(1,2,2)):
+        super().__init__()
+        self.down = down
+        self.reduction = nn.Linear(dim * np.prod(down), dim)
+        self.norm = nn.LayerNorm(dim * np.prod(down))
+
+    def forward(self, x, shape):
+        B, N, C = x.shape
+        T, H, W = shape
+        dT, dH, dW = self.down
+        Tn, Hn, Wn = T//dT, H//dH, W//dW
+
+        x = x.view(B, T, H, W, C)[:, :Tn*dT, :Hn*dH, :Wn*dW]    # crop
+        x = x.view(B, Tn, dT, Hn, dH, Wn, dW, C)
+        x = x.permute(0,1,3,5,2,4,6,7).contiguous()
+        x = x.view(B, Tn*Hn*Wn, -1)                 # concat neighbours
+        x = self.reduction(self.norm(x))
+        return x, (Tn, Hn, Wn)
+
+
 class RoPE3D(nn.Module):
     """
     3D Rotary Position Embeddings for spatiotemporal data
@@ -132,22 +220,17 @@ class DiTBlock(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
-        use_rope: bool = True
     ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-         # --- Rotary setup --------------------------------------------------
-        # We usually rotate *half* of the head dimension (LLMs-style).
-        # Feel free to choose any value ≤ head_dim, but it must equal the
-        # dim you give to RoPE3D.
-        self.rotary_dim = self.head_dim // 2      # 48 when head_dim = 96
         
         # Self-attention
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.attn_drop = nn.Dropout(dropout)
-        self.proj = nn.Linear(dim, dim, bias=False)
+        self.attn = WindowedSelfAttention(
+            dim, num_heads=num_heads,
+            window=(8, 8, 8), head_dim=self.head_dim
+        )
         
         # FFN
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -162,18 +245,13 @@ class DiTBlock(nn.Module):
         # Normalization and modulation
         self.norm1 = AdaLNZero(dim)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        
-        # RoPE
-        self.use_rope = use_rope
-        if use_rope:
-            self.rope = RoPE3D(self.rotary_dim)
     
     def forward(
         self, 
         x: torch.Tensor, 
         c: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        spatial_shape: Tuple[int, int, int]
+        ) -> torch.Tensor:
         """
         Args:
             x: Input features [B, N, C]
@@ -186,32 +264,8 @@ class DiTBlock(nn.Module):
         x_norm, gates = self.norm1(x, c)
         shift_ffn, scale_ffn, gate_attn, gate_ffn = gates
         
-        # Self-attention
-        qkv = self.qkv(x_norm).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        
-        # Apply RoPE to the first rotary_dim features only
-        if self.use_rope:
-            q_rot, q_pass = q[..., :self.rotary_dim], q[..., self.rotary_dim:]
-            k_rot, k_pass = k[..., :self.rotary_dim], k[..., self.rotary_dim:]
-
-            q_rot = self.rope(q_rot, seq_dim=2)
-            k_rot = self.rope(k_rot, seq_dim=2)
-
-            q = torch.cat([q_rot, q_pass], dim=-1)
-            k = torch.cat([k_rot, k_pass], dim=-1)
-        
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
-        
-        if mask is not None:
-            attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(1), float('-inf'))
-        
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_drop(attn)
-        
-        x_attn = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x_attn = self.proj(x_attn)
+        # local window attention
+        x_attn = self.attn(x_norm, spatial_shape)   # [B, N, C]
         
         # Gated residual for attention
         x = x + gate_attn.unsqueeze(1) * x_attn
@@ -302,8 +356,7 @@ class LungCTDiT(nn.Module):
         depth: int = 24,  # 24 layers -> ~0.6B params
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
-        dropout: float = 0.1,
-        use_rope: bool = True
+        dropout: float = 0.1
     ):
         super().__init__()
         
@@ -311,6 +364,7 @@ class LungCTDiT(nn.Module):
         self.latent_size = latent_size
         self.hidden_dim = hidden_dim
         self.num_tokens = np.prod(latent_size)
+        self.patch_merge = PatchMerging3D(hidden_dim, down=(1,2,2))
         
         # Patchify projection (1x1x1 conv)
         self.patchify = nn.Conv3d(
@@ -339,7 +393,6 @@ class LungCTDiT(nn.Module):
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
-                use_rope=use_rope
             )
             for _ in range(depth)
         ])
@@ -395,7 +448,11 @@ class LungCTDiT(nn.Module):
         # Patchify
         x = self.patchify(x_t)  # [B, hidden_dim, D, H, W]
         x = rearrange(x, 'b c d h w -> b (d h w) c')
-        
+        spatial_shape = (D, H//2, W//2)              # after merge
+
+        # ---- patch merge ----
+        x, spatial_shape = self.patch_merge(x, (D, H, W))
+
         # Time embedding
         t_emb = self.time_embed(t)
         
@@ -414,7 +471,7 @@ class LungCTDiT(nn.Module):
         
         # Apply transformer blocks
         for block in self.blocks:
-            x = block(x, t_emb)
+            x = block(x, t_emb, spatial_shape=spatial_shape)
         
         # Remove conditioning tokens
         x = x[:, flf_cond.shape[1]:]
@@ -456,5 +513,4 @@ def create_dit_model(config: Dict) -> LungCTDiT:
         num_heads=config.get('num_heads', 12),
         mlp_ratio=config.get('mlp_ratio', 4.0),
         dropout=config.get('dropout', 0.1),
-        use_rope=config.get('use_rope', True)
     )
