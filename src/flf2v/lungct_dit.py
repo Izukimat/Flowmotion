@@ -238,8 +238,8 @@ class FLF2VConditioning(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            first_frame: First frame latent [B, C, H, W, D]
-            last_frame: Last frame latent [B, C, H, W, D]
+            first_frame: First frame latent [B, C, 1, H, W]
+            last_frame: Last frame latent [B, C, 1, H, W]   
             frozen_mask: Binary mask [B, T] indicating frozen frames
         Returns:
             Conditioning features [B, N, C]
@@ -247,11 +247,11 @@ class FLF2VConditioning(nn.Module):
         B = first_frame.shape[0]
         
         # Flatten spatial dimensions
-        first_flat = rearrange(first_frame, 'b c h w d -> b (h w d) c')
-        last_flat = rearrange(last_frame, 'b c h w d -> b (h w d) c')
+        first_flat = rearrange(first_frame, 'b c t h w -> b (t h w) c')  # [B, 1*H*W, C]
+        last_flat = rearrange(last_frame, 'b c t h w -> b (t h w) c')    # [B, 1*H*W, C]
         
         # Concatenate and project
-        frames_concat = torch.cat([first_flat, last_flat], dim=-1)
+        frames_concat = torch.cat([first_flat, last_flat], dim=-1) # [B, H*W, 2*C]
         frames_feat = self.frame_proj(frames_concat)
         
         # Add positional embeddings
@@ -296,7 +296,7 @@ class LungCTDiT(nn.Module):
         
         # FLF2V conditioning
         self.flf_conditioning = FLF2VConditioning(
-            latent_channels * np.prod(latent_size),
+            latent_channels * 2,
             hidden_dim
         )
         
