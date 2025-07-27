@@ -404,7 +404,7 @@ def main():
     )
     
     # Setup mixed precision
-    scaler = GradScaler('cuda')
+    scaler = GradScaler(enabled=True)
     
     # Resume from checkpoint if specified
     start_epoch = 0
