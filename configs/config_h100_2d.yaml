@@ -7,22 +7,22 @@
 # • Uniform time-sampling keeps things simple; you can switch to logit-normal later
 
 model:
-  # ───────── VAE (2-D) ────────────────────────────────────────────────
-  vae_base_model: 'medvae_4_1_2d'     # 8× compression per spatial axis (=64× pixel-count)
-  latent_channels: 8                  # 1 → 8 channel expansion inside wrapper
+  vae_base_model: 'medvae_4_1_2d'
+  latent_channels: 8
   vae_temporal_weight: 0.1
-  freeze_vae_after: 5000            # fine-tune a few k steps, then freeze
+  freeze_vae_after: 0            # fine-tune a few k steps, then freeze
 
   # ───────── DiT (backbone) ───────────────────────────────────────────
   dit_config:
     latent_channels: 8
-    latent_size: [40, 16, 16]        # 40 frames, 128×128 → 16×16 after 8× down-sampling
-    hidden_dim: 1024
-    depth: 24                        # ~1.1 B parameters – H100 can handle it
+    latent_size: [82, 64, 64]        # 40 frames, 128×128 → 16×16 after 8× down-sampling
+    hidden_dim: 768
+    depth: 20                        # ~1.1 B parameters – H100 can handle it
     num_heads: 8
     mlp_ratio: 4.0
     dropout: 0.05
     use_rope: true
+    gradient_checkpointing: true
 
   # ───────── Flow-matching objective ─────────────────────────────────
   flow_matching_config:
@@ -45,7 +45,9 @@ training:
   vae_recon_weight: 1.0
   vae_kl_weight: 0.01
   vae_temporal_weight: 0.1
-
+  vae_chunk_size: 8 
+  finetune_vae: false
+  freeze_vae_after: 0
   # ───────── Schedule ────────────────────────────────────────────────
   num_epochs: 80
   val_freq: 4
@@ -63,8 +65,8 @@ data:
   # Input is a *single* axial slice time-series → 2-D VAE
   num_frames: 82
   input_frames: 10
-  target_size: [256, 256]           # resize each slice to 128²
-  slice_mode: 'three_slices'        # apex / mid / base
+  target_size: [512, 512]
+  slice_mode: 'three_slices'
   slice_indices: [12, 25, 37]
   intensity_window: [-1000, 500]
   normalize: true  # Apply lung windowing and normalize to [-1, 1]

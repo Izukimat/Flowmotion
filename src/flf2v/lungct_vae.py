@@ -62,27 +62,54 @@ class LungCTVAE(nn.Module):
         z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
         return z, mu, logvar
 
+
+    def _encode_2d_chunked(self, x2d: torch.Tensor, chunk_size: int = 8):
+        """Process frames in chunks to reduce memory usage"""
+        B_T = x2d.shape[0]
+        chunks = []
+        
+        # Process in chunks with no_grad to save memory during encoding
+        with torch.no_grad():
+            for i in range(0, B_T, chunk_size):
+                chunk = x2d[i:i+chunk_size]
+                post = self.base_vae.encode(chunk)
+                chunks.append((post.mean.detach(), post.logvar.detach()))
+        
+        # Concatenate results
+        mu = torch.cat([c[0] for c in chunks], dim=0)
+        logvar = torch.cat([c[1] for c in chunks], dim=0)
+        
+        # Only compute gradients for sampling if needed
+        if self.training and not self._vae_frozen:
+            mu = mu.requires_grad_(True)
+            logvar = logvar.requires_grad_(True)
+        
+        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+        return z, mu, logvar
     # ───────────────────────────────────────── public API ───────────────────
     def encode(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        x : [B, 1, T, H, W]  (pixel domain, −1…1)
-        returns latents  [B, C, T, H/8, W/8]
-        """
+        """Encode with chunked processing"""
         B, _, T, H, W = x.shape
-        x2d = x.permute(0,2,1,3,4).reshape(B*T, 1, H, W)        # (B·T,1,H,W)
-
-        z, mu, logvar = self._encode_2d(x2d)                     # (B·T,1,h,w)
+        x2d = x.permute(0,2,1,3,4).reshape(B*T, 1, H, W)
+        
+        # Use chunked encoding for large inputs
+        if H * W > 256 * 256:  # Threshold for chunking
+            z, mu, logvar = self._encode_2d_chunked(x2d, chunk_size=8)
+        else:
+            z, mu, logvar = self._encode_2d(x2d)
+        
+        # Rest of the processing remains the same...
         if self.latent_channels != 1:
             z = self.channel_exp(z)
-
+        
         if self.use_tanh_scaling:
             z = torch.tanh(z * self.latent_scale + self.latent_shift)
-
+        
         h, w = z.shape[-2:]
-        z = z.view(B, T, self.latent_channels, h, w).permute(0,2,1,3,4)  # (B,C,T,h,w)
+        z = z.view(B, T, self.latent_channels, h, w).permute(0,2,1,3,4)
         mu = mu.view(B, T, 1, h, w).permute(0,2,1,3,4)
         logvar = logvar.view(B, T, 1, h, w).permute(0,2,1,3,4)
-
+        
         return {"latent": z, "mu": mu, "logvar": logvar}
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:

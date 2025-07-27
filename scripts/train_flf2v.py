@@ -10,7 +10,8 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Any
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -112,111 +113,131 @@ def calculate_weighted_loss(loss_dict: Dict, weights: Dict[str, float], device: 
     
     return total_loss
 
-
-def train_epoch(
-    model: nn.Module,
-    train_loader: DataLoader,
+def train_epoch_(
+    model: LungCTFLF2V,
+    dataloader: DataLoader,
     vae_optimizer: optim.Optimizer,
     dit_optimizer: optim.Optimizer,
-    vae_scheduler: optim.lr_scheduler._LRScheduler,
-    dit_scheduler: optim.lr_scheduler._LRScheduler,
+    vae_scheduler: Any,
+    dit_scheduler: Any,
     scaler: GradScaler,
     epoch: int,
     config: Dict,
     device: str,
-    wandb_log: bool = True
+    use_wandb: bool = False
 ) -> Dict[str, float]:
-    """Train for one epoch"""
+    """Memory-optimized training epoch"""
     model.train()
+    losses = defaultdict(list)
     
-    epoch_losses = {
-        'total': [],
-        'velocity': [],
-        'flf': [],
-        'vae_recon': [],
-        'vae_kl': [],
-        'vae_temporal': []
-    }
+    # Check if VAE should be frozen
+    model_ref = model.module if hasattr(model, 'module') else model
+    if model_ref.training_step >= model_ref.freeze_vae_after:
+        model_ref._freeze_vae()
+        vae_optimizer = None  # No need to update frozen params
     
-    loss_weights = get_loss_weights(config)
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
-    for batch_idx, batch in enumerate(pbar):
-        # Get data - use target_frames as the full sequence for training
-        if 'video' in batch:
-            video = batch['video'].to(device)
-        elif 'target_frames' in batch:
-            video = batch['target_frames'].to(device)
-        else:
-            raise ValueError("No video data found in batch")
+    for batch_idx, batch in enumerate(progress_bar):
+        # Clear cache periodically
+        if batch_idx % 10 == 0:
+            torch.cuda.empty_cache()
         
-        print(f"debug batch shape: {video.shape}")   # expect [B, C, 42, 512, 512]
-
-        # Forward pass with mixed precision
+        # Move batch to device
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                 for k, v in batch.items()}
+        
+        # Forward pass with autocast
         with autocast():
-            # Train the model on full breathing sequence
-            loss_dict = model(video, return_dict=True)
+            # Encode frames with gradient disabled for frozen VAE
+            if model_ref._vae_frozen:
+                with torch.no_grad():
+                    first_latent = model_ref.vae.encode(batch['first_frame'])['latent']
+                    last_latent = model_ref.vae.encode(batch['last_frame'])['latent']
+                    if 'video' in batch:
+                        target_latent = model_ref.vae.encode(batch['video'])['latent']
+                    else:
+                        target_latent = None
+            else:
+                # Normal encoding with gradients
+                first_latent = model_ref.vae.encode(batch['first_frame'])['latent']
+                last_latent = model_ref.vae.encode(batch['last_frame'])['latent']
+                if 'video' in batch:
+                    encoded = model_ref.vae.encode(batch['video'])
+                    target_latent = encoded['latent']
+                    
+                    # VAE losses (only if not frozen)
+                    vae_loss = F.mse_loss(
+                        model_ref.vae.decode(target_latent), 
+                        batch['video']
+                    )
+                    kl_loss = -0.5 * torch.mean(
+                        1 + encoded['logvar'] - encoded['mu'].pow(2) - encoded['logvar'].exp()
+                    )
+                    losses['vae_recon'].append(vae_loss.item())
+                    losses['vae_kl'].append(kl_loss.item())
             
-            # Calculate weighted total loss - Fix: use loss filtering
-            total_loss = calculate_weighted_loss(loss_dict, loss_weights, device)
-        
-        # Backward pass - proper optimizer selection
-        if model.training_step < model.freeze_vae_after:
-            # Train VAE
-            vae_optimizer.zero_grad()
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(vae_optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                model.vae.parameters(), 
-                config['training'].get('grad_clip', 1.0)
+            # Flow matching forward (always with gradients)
+            flow_loss = model_ref.flow_matching(
+                x_1=target_latent,
+                first_frame=first_latent,
+                last_frame=last_latent,
+                model=model_ref.dit
             )
-            scaler.step(vae_optimizer)
-        else:
-            # Train DiT
-            dit_optimizer.zero_grad()
-            scaler.scale(total_loss).backward()
+            
+            # Total loss
+            loss_weights = get_loss_weights(config)
+            total_loss = flow_loss * loss_weights['velocity_weight']
+            
+            if not model_ref._vae_frozen and 'vae_recon' in losses:
+                total_loss += vae_loss * loss_weights['vae_recon_weight']
+                total_loss += kl_loss * loss_weights['vae_kl_weight']
+        
+        # Backward pass
+        scaler.scale(total_loss).backward()
+        
+        # Gradient accumulation
+        if (batch_idx + 1) % config['training']['gradient_accumulation_steps'] == 0:
+            # Clip gradients
             scaler.unscale_(dit_optimizer)
-            dit_params = list(model.dit.parameters()) + list(model.flow_matching.parameters())
+            if vae_optimizer:
+                scaler.unscale_(vae_optimizer)
+            
             torch.nn.utils.clip_grad_norm_(
-                dit_params, 
-                config['training'].get('grad_clip', 1.0)
+                model.parameters(), 
+                config['training']['grad_clip']
             )
+            
+            # Update weights
             scaler.step(dit_optimizer)
-        
-        scaler.update()
-        
-        # Logging - only log loss values
-        for key in epoch_losses:
-            loss_key = f'loss_{key}' if key != 'total' else None
-            if loss_key and loss_key in loss_dict and isinstance(loss_dict[loss_key], torch.Tensor):
-                epoch_losses[key].append(loss_dict[loss_key].item())
-        epoch_losses['total'].append(total_loss.item())
+            if vae_optimizer:
+                scaler.step(vae_optimizer)
+            
+            scaler.update()
+            
+            # Zero gradients
+            dit_optimizer.zero_grad(set_to_none=True)
+            if vae_optimizer:
+                vae_optimizer.zero_grad(set_to_none=True)
         
         # Update progress bar
-        pbar.set_postfix({
-            'loss': f"{total_loss.item():.4f}",
-            'stage': 'VAE' if model.training_step < model.freeze_vae_after else 'DiT'
+        losses['total'].append(total_loss.item())
+        progress_bar.set_postfix({
+            'loss': np.mean(losses['total'][-10:]),
+            'mem_gb': torch.cuda.max_memory_allocated() / 1e9
         })
         
-        # WandB logging
-        if wandb_log and batch_idx % 50 == 0:
-            log_dict = {}
-            for key, value in loss_dict.items():
-                if key.startswith('loss_') and isinstance(value, torch.Tensor):
-                    log_dict[f'train/{key}'] = value.item()
-            log_dict['train/total_loss'] = total_loss.item()
-            log_dict['train/step'] = epoch * len(train_loader) + batch_idx
-            wandb.log(log_dict)
+        # Increment step counter
+        model_ref.training_step += 1
     
-    # Update learning rates
-    if model.training_step < model.freeze_vae_after:
-        vae_scheduler.step()
-    else:
-        dit_scheduler.step()
+    # Average losses
+    avg_losses = {k: np.mean(v) for k, v in losses.items()}
     
-    # Return epoch averages
-    return {k: np.mean(v) if v else 0.0 for k, v in epoch_losses.items()}
-
+    # Log to wandb
+    if use_wandb:
+        wandb.log({f'train/{k}': v for k, v in avg_losses.items()}, step=epoch)
+    
+    return avg_losses
 
 def validate_epoch(
     model: nn.Module,
