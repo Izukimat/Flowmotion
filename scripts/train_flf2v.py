@@ -113,7 +113,7 @@ def calculate_weighted_loss(loss_dict: Dict, weights: Dict[str, float], device: 
     
     return total_loss
 
-def train_epoch_(
+def train_epoch(
     model: LungCTFLF2V,
     dataloader: DataLoader,
     vae_optimizer: optim.Optimizer,
@@ -139,156 +139,169 @@ def train_epoch_(
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
     for batch_idx, batch in enumerate(progress_bar):
-        # Clear cache periodically
-        if batch_idx % 10 == 0:
-            torch.cuda.empty_cache()
+        # Move batch data to device
+        if 'video' in batch:
+            video = batch['video'].to(device)  # [B, 1, T, H, W]
+        elif 'target_frames' in batch:
+            video = batch['target_frames'].to(device)
+        else:
+            raise KeyError("Batch must contain either 'video' or 'target_frames'")
         
-        # Move batch to device
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                 for k, v in batch.items()}
+        # Extract first and last frames from the video sequence
+        B, C, T, H, W = video.shape
+        
+        # For FLF2V, we need first and last frames
+        # Option 1: Use actual first and last frames
+        first_frame = video[:, :, 0:1, :, :]    # [B, 1, 1, H, W]
+        last_frame = video[:, :, -1:, :, :]     # [B, 1, 1, H, W]
+        
+        # Option 2: If input_frames exist, use those instead (they're the original 10 frames)
+        if 'input_frames' in batch:
+            input_frames = batch['input_frames'].to(device)  # [B, 1, 10, H, W]
+            # Use frame 0 and frame 9 from the original frames
+            first_frame = input_frames[:, :, 0:1, :, :]   # [B, 1, 1, H, W]
+            last_frame = input_frames[:, :, -1:, :, :]    # [B, 1, 1, H, W]
         
         # Forward pass with autocast
         with autocast():
-            # Encode frames with gradient disabled for frozen VAE
-            if model_ref._vae_frozen:
-                with torch.no_grad():
-                    first_latent = model_ref.vae.encode(batch['first_frame'])['latent']
-                    last_latent = model_ref.vae.encode(batch['last_frame'])['latent']
-                    if 'video' in batch:
-                        target_latent = model_ref.vae.encode(batch['video'])['latent']
-                    else:
-                        target_latent = None
-            else:
-                # Normal encoding with gradients
-                first_latent = model_ref.vae.encode(batch['first_frame'])['latent']
-                last_latent = model_ref.vae.encode(batch['last_frame'])['latent']
-                if 'video' in batch:
-                    encoded = model_ref.vae.encode(batch['video'])
-                    target_latent = encoded['latent']
-                    
-                    # VAE losses (only if not frozen)
-                    vae_loss = F.mse_loss(
-                        model_ref.vae.decode(target_latent), 
-                        batch['video']
-                    )
-                    kl_loss = -0.5 * torch.mean(
-                        1 + encoded['logvar'] - encoded['mu'].pow(2) - encoded['logvar'].exp()
-                    )
-                    losses['vae_recon'].append(vae_loss.item())
-                    losses['vae_kl'].append(kl_loss.item())
-            
-            # Flow matching forward (always with gradients)
-            flow_loss = model_ref.flow_matching(
-                x_1=target_latent,
-                first_frame=first_latent,
-                last_frame=last_latent,
-                model=model_ref.dit
+            # Get all losses from the model
+            all_losses = model_ref(
+                first_frame=first_frame,
+                last_frame=last_frame,
+                target_frames=video,
+                return_dict=True
             )
             
-            # Total loss
-            loss_weights = get_loss_weights(config)
-            total_loss = flow_loss * loss_weights['velocity_weight']
+            # Extract individual losses
+            total_loss = all_losses['total']
             
-            if not model_ref._vae_frozen and 'vae_recon' in losses:
-                total_loss += vae_loss * loss_weights['vae_recon_weight']
-                total_loss += kl_loss * loss_weights['vae_kl_weight']
+            # Record losses
+            for key, value in all_losses.items():
+                if isinstance(value, torch.Tensor):
+                    losses[key].append(value.item())
         
         # Backward pass
         scaler.scale(total_loss).backward()
         
         # Gradient accumulation
         if (batch_idx + 1) % config['training']['gradient_accumulation_steps'] == 0:
-            # Clip gradients
-            scaler.unscale_(dit_optimizer)
-            if vae_optimizer:
+            # Unscale gradients
+            if dit_optimizer is not None:
+                scaler.unscale_(dit_optimizer)
+            if vae_optimizer is not None and not model_ref._vae_frozen:
                 scaler.unscale_(vae_optimizer)
             
+            # Clip gradients
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), 
                 config['training']['grad_clip']
             )
             
             # Update weights
-            scaler.step(dit_optimizer)
-            if vae_optimizer:
+            if dit_optimizer is not None:
+                scaler.step(dit_optimizer)
+            if vae_optimizer is not None and not model_ref._vae_frozen:
                 scaler.step(vae_optimizer)
             
             scaler.update()
             
             # Zero gradients
-            dit_optimizer.zero_grad(set_to_none=True)
-            if vae_optimizer:
+            if dit_optimizer is not None:
+                dit_optimizer.zero_grad(set_to_none=True)
+            if vae_optimizer is not None:
                 vae_optimizer.zero_grad(set_to_none=True)
         
         # Update progress bar
-        losses['total'].append(total_loss.item())
         progress_bar.set_postfix({
-            'loss': np.mean(losses['total'][-10:]),
+            'loss': np.mean(losses['total'][-10:]) if losses['total'] else 0,
             'mem_gb': torch.cuda.max_memory_allocated() / 1e9
         })
         
-        # Increment step counter
+        # Increment training step
         model_ref.training_step += 1
+        
+        # Clear cache periodically
+        if batch_idx % 10 == 0:
+            torch.cuda.empty_cache()
+    
+    # Step schedulers
+    if vae_scheduler is not None:
+        vae_scheduler.step()
+    if dit_scheduler is not None:
+        dit_scheduler.step()
     
     # Average losses
-    avg_losses = {k: np.mean(v) for k, v in losses.items()}
+    avg_losses = {k: np.mean(v) for k, v in losses.items() if v}
     
     # Log to wandb
     if use_wandb:
         wandb.log({f'train/{k}': v for k, v in avg_losses.items()}, step=epoch)
+        wandb.log({
+            'train/lr_vae': vae_optimizer.param_groups[0]['lr'] if vae_optimizer else 0,
+            'train/lr_dit': dit_optimizer.param_groups[0]['lr'] if dit_optimizer else 0,
+        }, step=epoch)
     
     return avg_losses
 
+
 def validate_epoch(
-    model: nn.Module,
-    val_loader: DataLoader,
-    epoch: int,
-    config: Dict,
-    device: str,
-    wandb_log: bool = True
-) -> Dict[str, float]:
-    """Validate for one epoch"""
+    model,
+    dataloader,
+    epoch,
+    config,
+    device,
+    use_wandb=False
+):
+    """Validate one epoch - Fixed to handle actual data structure"""
     model.eval()
+    losses = defaultdict(list)
     
-    val_losses = {
-        'total': [],
-        'velocity': [],
-        'flf': [],
-        'vae_recon': [],
-        'vae_kl': [],
-        'vae_temporal': []
-    }
-    
-    loss_weights = get_loss_weights(config)
+    model_ref = model.module if hasattr(model, 'module') else model
     
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(val_loader, desc=f"Val {epoch}")):
+        for batch in tqdm(dataloader, desc=f"Val Epoch {epoch}"):
+            # Move batch data to device
             if 'video' in batch:
                 video = batch['video'].to(device)
             elif 'target_frames' in batch:
                 video = batch['target_frames'].to(device)
             else:
-                continue
+                raise KeyError("Batch must contain either 'video' or 'target_frames'")
+            
+            B, C, T, H, W = video.shape
+            
+            # Extract frames
+            first_frame = video[:, :, 0:1, :, :]
+            last_frame = video[:, :, -1:, :, :]
+            
+            # Use original frames if available
+            if 'input_frames' in batch:
+                input_frames = batch['input_frames'].to(device)
+                first_frame = input_frames[:, :, 0:1, :, :]
+                last_frame = input_frames[:, :, -1:, :, :]
             
             # Forward pass
-            loss_dict = model(video, return_dict=True)
-            total_loss = calculate_weighted_loss(loss_dict, loss_weights, device)
-            
-            # Collect losses - only collect loss values
-            for key in val_losses:
-                loss_key = f'loss_{key}' if key != 'total' else None
-                if loss_key and loss_key in loss_dict and isinstance(loss_dict[loss_key], torch.Tensor):
-                    val_losses[key].append(loss_dict[loss_key].item())
-            val_losses['total'].append(total_loss.item())
+            with autocast():
+                all_losses = model_ref(
+                    first_frame=first_frame,
+                    last_frame=last_frame,
+                    target_frames=video,
+                    return_dict=True
+                )
+                
+                # Record losses
+                for key, value in all_losses.items():
+                    if isinstance(value, torch.Tensor):
+                        losses[key].append(value.item())
     
-    # Log validation results
-    val_averages = {k: np.mean(v) if v else 0.0 for k, v in val_losses.items()}
+    # Average losses
+    avg_losses = {k: np.mean(v) for k, v in losses.items() if v}
     
-    if wandb_log:
-        log_dict = {f'val/{k}': v for k, v in val_averages.items()}
-        wandb.log(log_dict)
+    # Log to wandb
+    if use_wandb:
+        wandb.log({f'val/{k}': v for k, v in avg_losses.items()}, step=epoch)
     
-    return val_averages
+    return avg_losses
 
 
 def main():
