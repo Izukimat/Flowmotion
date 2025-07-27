@@ -128,6 +128,15 @@ class FlowMatching(nn.Module):
         else:
             loss_weight = 1.0
         
+        # for 3D
+        # vt_target = F.interpolate(
+        # vt_target, size=vt_pred.shape[2:], mode="trilinear", align_corners=False
+        # )
+        
+        if vt_pred.shape != vt_target.shape:
+            vt_target = F.interpolate(
+                vt_target, size=vt_pred.shape[-2:], mode="bilinear", align_corners=False
+            )
         # MSE loss on velocity
         loss_velocity = F.mse_loss(vt_pred * loss_weight, vt_target * loss_weight)
         
