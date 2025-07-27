@@ -151,7 +151,7 @@ def train_epoch(
         B, C, T, H, W = video.shape
         
         # Forward pass with autocast
-        with torch.amp.autocast():
+        with torch.amp.autocast(device_type='cuda'):
             # Get all losses from the model
             all_losses = model_ref(
                 video=video,
@@ -257,7 +257,7 @@ def validate_epoch(
             B, C, T, H, W = video.shape
             
             # Forward pass
-            with torch.amp.autocast():
+            with torch.amp.autocast(device_type='cuda'):
                 all_losses = model_ref(
                     video=video,
                     return_dict=True
@@ -404,7 +404,7 @@ def main():
     )
     
     # Setup mixed precision
-    scaler = GradScaler()
+    scaler = GradScaler(device_type='cuda')
     
     # Resume from checkpoint if specified
     start_epoch = 0
