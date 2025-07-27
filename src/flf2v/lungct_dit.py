@@ -25,13 +25,6 @@ class WindowedSelfAttention(nn.Module):
         self.qkv  = nn.Linear(dim, 3 * num_heads * head_dim, bias=False)
         self.proj = nn.Linear(num_heads * head_dim, dim)
 
-    def patchify_and_merge(self, x_latent):
-        """latent [B,C,1,H,W] → tokens [B, H′·W′, C] after 1× merge"""
-        x = self.patchify(x_latent)                       # [B,C,1,H′,W′]
-        x = rearrange(x, 'b c t h w -> b (t h w) c')      # flatten
-        x, _ = self.patch_merge(x, (1, self.H, self.W))   # same merge
-        return x
-
     def forward(self, x, shape):
         """
         x : [B, N, C]  – flattened tokens
@@ -422,6 +415,13 @@ class LungCTDiT(nn.Module):
         # Zero-init output projection
         nn.init.zeros_(self.proj_out.weight)
         nn.init.zeros_(self.proj_out.bias)
+
+    def patchify_and_merge(self, x_latent):
+        """latent [B,C,1,H,W] → tokens [B, H′·W′, C] after 1× merge"""
+        x = self.patchify(x_latent)                       # [B,C,1,H′,W′]
+        x = rearrange(x, 'b c t h w -> b (t h w) c')      # flatten
+        x, _ = self.patch_merge(x, (1, self.H, self.W))   # same merge
+        return x
     
     def forward(
         self,
