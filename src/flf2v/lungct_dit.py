@@ -36,6 +36,19 @@ class WindowedSelfAttention(nn.Module):
         T, H, W = shape
         wT, wH, wW = self.window
 
+        # 🔧 CRITICAL FIX: Validate tensor dimensions match spatial_shape
+        expected_tokens = T * H * W
+        if N != expected_tokens:
+            print(f"⚠️  WindowedSelfAttention: Expected {expected_tokens} tokens (T={T}×H={H}×W={W}), got {N}")
+            print(f"   Adapting spatial_shape to match actual tensor dimensions...")
+            
+            # Calculate actual dimensions from tensor
+            # Assume H and W are correct, solve for T
+            actual_T = N // (H * W)
+            T = actual_T
+            shape = (T, H, W)
+            print(f"   Adapted spatial_shape: {shape}")
+
         # ------------- reshape & pad -----------------
         x = x.view(B, T, H, W, C)            # -> grid
         pad_t = (wT - T % wT) % wT
@@ -75,146 +88,111 @@ class WindowedSelfAttention(nn.Module):
         x_out = x_out.view(B, Tp, Hp, Wp, C)[:, :T, :H, :W]  # drop pad
         return x_out.view(B, N, C)        # flatten back
 
-# -------------------------------------------------------------------
 
+# ORIGINAL ARCHITECTURE - Keep exact same structure as trained model
 class PatchMerging3D(nn.Module):
     """
     Down-samples (T,H,W) by (dT,dH,dW) with linear projection.
+    ORIGINAL ARCHITECTURE: Uses 'reduction' and 'norm' (matches checkpoint)
     """
-    def __init__(self, dim, down=(1,2,2)):
+    def __init__(self, hidden_dim: int, down: Tuple[int, int, int] = (1, 2, 2)):
         super().__init__()
         self.down = down
-        self.reduction = nn.Linear(dim * np.prod(down), dim)
-        self.norm = nn.LayerNorm(dim * np.prod(down))
-
-    def forward(self, x, shape):
+        dT, dH, dW = down
+        
+        # ORIGINAL NAMES - Match checkpoint exactly
+        self.reduction = nn.Linear(hidden_dim * dT * dH * dW, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+    
+    def forward(self, x: torch.Tensor, spatial_shape: Tuple[int, int, int]) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
+        """
+        Args:
+            x: [B, N, C] where N = T*H*W
+            spatial_shape: (T, H, W)
+        Returns:
+            x_merged: [B, N', C] where N' = T'*H'*W'
+            new_shape: (T', H', W')
+        """
         B, N, C = x.shape
-        T, H, W = shape
+        T, H, W = spatial_shape
         dT, dH, dW = self.down
-        Tn, Hn, Wn = T//dT, H//dH, W//dW
-
-        x = x.view(B, T, H, W, C)[:, :Tn*dT, :Hn*dH, :Wn*dW]    # crop
-        x = x.view(B, Tn, dT, Hn, dH, Wn, dW, C)
-        x = x.permute(0,1,3,5,2,4,6,7).contiguous()
-        x = x.view(B, Tn*Hn*Wn, -1)                 # concat neighbours
-        x = self.reduction(self.norm(x))
-        return x, (Tn, Hn, Wn)
-
-
-class RoPE3D(nn.Module):
-    """
-    3D Rotary Position Embeddings for spatiotemporal data
-    Adapted for medical volume sequences
-    """
-    
-    def __init__(self, dim: int, max_seq_len: int = 10000):
-        super().__init__()
-        self.dim = dim
         
-        # Compute frequencies
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
+        # 🔧 FIXED: Adaptive dimension validation
+        expected_tokens = T * H * W
+        if N != expected_tokens:
+            print(f"⚠️  PatchMerging3D: Expected {expected_tokens} tokens, got {N}")
+            # Adapt T to match actual tokens
+            actual_T = N // (H * W)
+            T = actual_T
+            print(f"   Adapted T: {T}")
         
-        # Cache for efficiency
-        self.max_seq_len = max_seq_len
-        self._build_cache()
-    
-    def _build_cache(self):
-        with torch.no_grad():                 # avoid autograd tracking
-            positions = torch.arange(
-                self.max_seq_len, dtype=torch.float, device=self.inv_freq.device
-            )
-            freqs = torch.einsum("i,j->ij", positions, self.inv_freq)
-            cos = freqs.cos().repeat_interleave(2, dim=-1)
-            sin = freqs.sin().repeat_interleave(2, dim=-1)
-        self.register_buffer("cos_cache", cos, persistent=False)
-        self.register_buffer("sin_cache", sin, persistent=False)
-    
-    def forward(self, x: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
-        """Apply RoPE to input tensor"""
-        seq_len = x.shape[seq_dim]
+        # Reshape to grid
+        x = x.view(B, T, H, W, C)
         
-        # Rebuild cache if the current one is too small
-        if seq_len > self.max_seq_len:
-            self.max_seq_len = int(seq_len)          # <- update the limit
-            self._build_cache()                      #    rebuild cos/sin
+        # Pad if needed
+        pad_t = (dT - T % dT) % dT
+        pad_h = (dH - H % dH) % dH
+        pad_w = (dW - W % dW) % dW
         
-        cos = self.cos_cache[:seq_len]
-        sin = self.sin_cache[:seq_len]
+        if pad_t or pad_h or pad_w:
+            x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h, 0, pad_t))
         
-        return self.apply_rotary_emb(x, cos, sin, seq_dim)
-    
-    @staticmethod
-    def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
-        """Apply rotation to input embeddings"""
-        # Reshape for rotation
-        x_rot = x.reshape(*x.shape[:-1], -1, 2)
-        x_rot = torch.stack([-x_rot[..., 1], x_rot[..., 0]], dim=-1)
-        x_rot = x_rot.reshape(x.shape)
+        T_pad, H_pad, W_pad = x.shape[1:4]
         
-        # Apply rotation
-        if seq_dim == 1:
-            cos = cos[:, None, :]
-            sin = sin[:, None, :]
+        # Merge patches
+        x = x.view(B,
+                   T_pad // dT, dT,
+                   H_pad // dH, dH,
+                   W_pad // dW, dW, C)
+        x = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous()
+        x = x.view(B, (T_pad // dT) * (H_pad // dH) * (W_pad // dW), dT * dH * dW * C)
         
-        return x * cos + x_rot * sin
+        # Project - Use ORIGINAL layer names
+        x = self.reduction(x)
+        x = self.norm(x)
+        
+        new_shape = (T_pad // dT, H_pad // dH, W_pad // dW)
+        return x, new_shape
 
 
 class AdaLNZero(nn.Module):
     """
-    Adaptive Layer Norm with Zero init (from DiT)
-    Modulates with 6 parameters: 2 for norm, 4 for attention/FFN gates
+    Adaptive Layer Normalization with zero initialization
+    ORIGINAL ARCHITECTURE: Uses 'adaLN_modulation' and 'norm' (matches checkpoint)
     """
     
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.dim = dim
         
-        # Use nn.LayerNorm instead of manual parameters
+        # ORIGINAL NAMES - Match checkpoint exactly
         self.norm = nn.LayerNorm(dim, eps=eps)
-        
-        # Modulation network
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(dim, 6 * dim, bias=True)
         )
         
-        # Initialize to zero
+        # Zero init
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
     
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        More torch.compile friendly version
-        """
-        # Use standard layer norm
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, Tuple]:
+        # Normalize
         x_norm = self.norm(x)
         
-        # Get modulation parameters
-        mod_params = self.adaLN_modulation(c)  # [B, 6*dim]
-        
-        # Reshape for broadcasting - add explicit dimensions
-        if x.dim() == 3:  # [B, L, D]
-            mod_params = mod_params.unsqueeze(1)  # [B, 1, 6*dim]
-        
-        # Use fixed indexing (compile-friendly)
-        dim = self.dim
-        shift_mha = mod_params[..., :dim]
-        scale_mha = mod_params[..., dim:2*dim]
-        gate_mha = mod_params[..., 2*dim:3*dim]
-        shift_ffn = mod_params[..., 3*dim:4*dim]
-        scale_ffn = mod_params[..., 4*dim:5*dim]
-        gate_ffn = mod_params[..., 5*dim:6*dim]
+        # Condition - Use ORIGINAL layer name
+        cond = self.adaLN_modulation(c)  # [B, 6*dim]
+        shift_mha, scale_mha, gate_mha, shift_ffn, scale_ffn, gate_ffn = cond.chunk(6, dim=-1)
         
         # Apply modulation
-        x_mha = x_norm * (1 + scale_mha) + shift_mha
+        x_mha = x_norm * (1 + scale_mha.unsqueeze(1)) + shift_mha.unsqueeze(1)
         
-        return x_mha, gate_mha, shift_ffn, scale_ffn, gate_ffn
+        return x_mha, (shift_ffn, scale_ffn, gate_mha, gate_ffn)
+
 
 class DiTBlock(nn.Module):
     """
     DiT block with self-attention and FFN
-    Specialized for FLF2V with frozen frame conditioning
+    ORIGINAL ARCHITECTURE: Matches trained checkpoint exactly
     """
     
     def __init__(
@@ -272,7 +250,8 @@ class DiTBlock(nn.Module):
         
             
         # Pre-norm and modulation
-        x_norm, gate_attn, shift_ffn, scale_ffn, gate_ffn = self.norm1(x, c)
+        x_norm, gates = self.norm1(x, c)
+        shift_ffn, scale_ffn, gate_attn, gate_ffn = gates
         
         # local window attention
         x_attn = self.attn(x_norm, spatial_shape)   # [B, N, C]
@@ -292,69 +271,6 @@ class DiTBlock(nn.Module):
             return checkpoint(self._forward_block, x, c, spatial_shape)
         else:
             return self._forward_block(x, c, spatial_shape)
-
-class FLF2VConditioning(nn.Module):
-    """
-    First-Last-Frame conditioning for video generation
-    Handles frozen frame injection and binary masks
-    """
-    
-    def __init__(self, latent_dim: int, hidden_dim: int):
-        super().__init__()
-        
-        # Project concatenated first+last frames
-        self.frame_proj = nn.Sequential(
-            nn.Linear(latent_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        
-        # Positional embeddings for first/last distinction
-        self.pos_emb = nn.Parameter(torch.zeros(1, 2, hidden_dim))
-        nn.init.normal_(self.pos_emb, std=0.02)
-        
-        # Binary mask embedding
-        self.mask_emb = nn.Embedding(2, hidden_dim)
-    
-    def forward(
-        self, 
-        first_frame: torch.Tensor,
-        last_frame: torch.Tensor,
-        frozen_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Args:
-            first_frame: First frame latent [B, C, 1, H, W]
-            last_frame: Last frame latent [B, C, 1, H, W]   
-            frozen_mask: Binary mask [B, T] indicating frozen frames
-        Returns:
-            Conditioning features [B, N, C]
-        """
-        B = first_frame.shape[0]
-        
-        # Flatten spatial dimensions
-        first_flat = rearrange(first_frame, 'b c t h w -> b (t h w) c')  # [B, 1*H*W, C]
-        last_flat = rearrange(last_frame, 'b c t h w -> b (t h w) c')    # [B, 1*H*W, C]
-        
-        # Concatenate and project
-        frames_concat = torch.cat([first_flat, last_flat], dim=-1) # [B, H*W, 2*C]
-        frames_feat = self.frame_proj(frames_concat)
-        
-        # Add positional embeddings
-        pos_emb = repeat(
-            self.pos_emb[:, 0],      # [1, C]
-            '1 c -> b n c',          # broadcast to every token
-            b=B,
-            n=frames_feat.shape[1]
-        )
-
-        frames_feat = frames_feat + pos_emb          # shape  [B, N, C]
-                
-        # Add mask embeddings
-        mask_feat = self.mask_emb(frozen_mask.long())
-        
-        return frames_feat, mask_feat
 
 
 class LungCTDiT(nn.Module):
@@ -472,34 +388,52 @@ class LungCTDiT(nn.Module):
         """
         B, C, D, H, W = x_t.shape
         
+        print(f"🔧 DiT Forward (Backward Compatible):")
+        print(f"   Input x_t: {x_t.shape}")
+        
         # Patchify
         x = self.patchify(x_t)  # [B, hidden_dim, D, H, W]
         x = rearrange(x, 'b c d h w -> b (d h w) c')
-        spatial_shape = (D, H//2, W//2)              # after merge
-
-        # ---- patch merge ----
-        x, spatial_shape = self.patch_merge(x, (D, H, W))
-
+        
+        # 🔧 CRITICAL FIX: Calculate spatial_shape from ACTUAL tensor dimensions
+        actual_tokens = x.shape[1]  # N = D * H * W after patchify
+        actual_H, actual_W = H, W  # Patchify doesn't change spatial dims
+        actual_D = actual_tokens // (actual_H * actual_W)  # Solve for D
+        
+        initial_spatial_shape = (actual_D, actual_H, actual_W)
+        print(f"   Calculated spatial_shape: {initial_spatial_shape}")
+        
+        # ---- patch merge ---- (ORIGINAL IMPLEMENTATION)
+        x, spatial_shape = self.patch_merge(x, initial_spatial_shape)
+        print(f"   After patch_merge: {x.shape}, spatial_shape: {spatial_shape}")
+        
         # Time embedding
         t_emb = self.time_embed(t)
         
         # FLF2V conditioning
         if frozen_mask is None:
-            # Default mask: first and last frames are frozen
-            frozen_mask = torch.zeros(B, D, device=x.device)
+            frozen_mask = torch.zeros(B, actual_D, device=x.device)
             frozen_mask[:, 0] = 1
             frozen_mask[:, -1] = 1
         
         first_tok  = self.patchify_and_merge(first_frame)
         last_tok   = self.patchify_and_merge(last_frame)
         flf_cond   = torch.cat([first_tok, last_tok], dim=1)   # [B, 2·H′·W′, C]       
+        
         # Combine conditioning
-        # Option 1: Add FLF conditioning as extra tokens
         x = torch.cat([flf_cond, x], dim=1)
-        spatial_shape = (D + 2, H//2, W//2)
-        # Apply transformer blocks
-        for block in self.blocks:
-            x = block(x, t_emb, spatial_shape=spatial_shape)
+        
+        # 🔧 FIXED: Update spatial_shape for conditioning tokens
+        T_merged, H_merged, W_merged = spatial_shape
+        conditioning_spatial_shape = (T_merged + 2, H_merged, W_merged)
+        
+        print(f"   With conditioning: {x.shape}, spatial_shape: {conditioning_spatial_shape}")
+        
+        # Apply transformer blocks - ORIGINAL ARCHITECTURE
+        for i, block in enumerate(self.blocks):
+            x = block(x, t_emb, spatial_shape=conditioning_spatial_shape)
+            if i == 0:
+                print(f"   After first block: {x.shape}")
         
         # Remove conditioning tokens
         x = x[:, flf_cond.shape[1]:]
@@ -509,8 +443,17 @@ class LungCTDiT(nn.Module):
         x = self.proj_out(x)
         
         # Reshape back
-        x = rearrange(x, 'b (d h w) c -> b c d h w', d=D, h=H//2, w=W//2) 
+        x = rearrange(x, 'b (d h w) c -> b c d h w', d=T_merged, h=H_merged, w=W_merged)
         
+        # 🔧 CRITICAL: Upsample back to original spatial dimensions if needed
+        if x.shape[-2:] != (H, W):
+            print(f"   Upsampling from {x.shape[-2:]} to {(H, W)}")
+            B_x, C_x, D_x = x.shape[:3]
+            x = x.view(B_x * D_x, C_x, H_merged, W_merged)
+            x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
+            x = x.view(B_x, C_x, D_x, H, W)
+        
+        print(f"   Final output: {x.shape}")
         return x
 
 

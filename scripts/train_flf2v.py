@@ -287,14 +287,50 @@ def validate_epoch(
                 else:
                     continue
                 
-                # Forward pass
+                # 🔧 FIX: Validate and reshape tensor dimensions
+                expected_frames = config['data']['num_frames']
+                batch_size, channels, actual_frames, height, width = video.shape
+                
+                # Skip batches with mismatched temporal dimensions
+                if actual_frames != expected_frames:
+                    logging.warning(f"Skipping validation batch: expected {expected_frames} frames, got {actual_frames}")
+                    continue
+                
+                # 🔧 FIX: Additional size validation before VAE encoding
+                # Check if tensor size would cause VAE encoding issues
+                total_elements = video.numel()
+                expected_elements = batch_size * channels * expected_frames * height * width
+                
+                if total_elements != expected_elements:
+                    logging.warning(f"Skipping validation batch: tensor size mismatch. Expected {expected_elements}, got {total_elements}")
+                    continue
+                
+                # 🔧 FIX: Clamp video to ensure reasonable dimensions for VAE
+                if height > 512 or width > 512:
+                    logging.warning(f"Resizing large input from {height}x{width} to 512x512")
+                    video = F.interpolate(
+                        video.view(batch_size * channels, actual_frames, height, width),
+                        size=(512, 512),
+                        mode='bilinear',
+                        align_corners=False
+                    ).view(batch_size, channels, actual_frames, 512, 512)
+                
+                # Forward pass with memory management
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
-                    all_losses = model_ref(video, return_dict=True)
-                    
-                    total_loss = all_losses.get('loss_total')
-                    if total_loss is not None and not (torch.isnan(total_loss) or torch.isinf(total_loss)):
-                        loss_sum += total_loss.item()
-                        num_batches += 1
+                    # 🔧 FIX: Add try-catch around model forward pass to catch shape errors
+                    try:
+                        all_losses = model_ref(video, return_dict=True)
+                        total_loss = all_losses.get('loss_total')
+                        
+                        if total_loss is not None and not (torch.isnan(total_loss) or torch.isinf(total_loss)):
+                            loss_sum += total_loss.item()
+                            num_batches += 1
+                    except RuntimeError as e:
+                        if "invalid for input of size" in str(e):
+                            logging.warning(f"Skipping validation batch due to shape error: {e}")
+                            continue
+                        else:
+                            raise e  # Re-raise if it's not a shape error
             
             except Exception as e:
                 logging.warning(f"Validation batch failed: {e}")

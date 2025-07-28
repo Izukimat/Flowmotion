@@ -22,7 +22,7 @@ class LungCTFLF2V(nn.Module):
     """
     First-Last Frame to Video (FLF2V) model for lung CT sequences
     Combines VAE, DiT, and Flow Matching for temporal interpolation
-    Fixed: proper loss handling and VAE freezing
+    FIXED: Configurable sequence lengths for runtime cropping
     """
     
     def __init__(
@@ -68,75 +68,81 @@ class LungCTFLF2V(nn.Module):
         """Decode latents to frame space"""
         return self.vae.decode(latents)
     
-    def get_memory_stats(self) -> Dict[str, float]:
-        """Get current memory usage statistics"""
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1e9
-            cached = torch.cuda.memory_reserved() / 1e9
-            max_allocated = torch.cuda.max_memory_allocated() / 1e9
-            
-            return {
-                'allocated_gb': allocated,
-                'cached_gb': cached, 
-                'max_allocated_gb': max_allocated,
-                'vae_frozen': self._vae_frozen,
-                'training_step': self.training_step
-            }
+    def crop_sequence_runtime(
+        self, 
+        video: torch.Tensor, 
+        target_length: int,
+        crop_strategy: str = "center"
+    ) -> torch.Tensor:
+        """
+        Runtime sequence cropping for flexible training/inference
+        
+        Args:
+            video: Input video [B, C, T, H, W]
+            target_length: Desired sequence length
+            crop_strategy: "center", "start", "end", or "phase_0_to_5"
+        
+        Returns:
+            Cropped video [B, C, target_length, H, W]
+        """
+        B, C, T, H, W = video.shape
+        
+        if target_length >= T:
+            return video  # No cropping needed
+        
+        if crop_strategy == "center":
+            start_idx = (T - target_length) // 2
+            end_idx = start_idx + target_length
+        elif crop_strategy == "start":
+            start_idx = 0
+            end_idx = target_length
+        elif crop_strategy == "end":
+            start_idx = T - target_length
+            end_idx = T
+        elif crop_strategy == "phase_0_to_5":
+            # For FLF2V: crop from phase 0 (0%) to phase 5 (50% breathing)
+            # Assuming 82-frame sequence covers 90% of breathing cycle
+            # Phase 5 (50%) is at frame index ~45 (50/90 * 82)
+            phase_5_idx = min(int(0.5 / 0.9 * T), T - 1)
+            end_idx = min(phase_5_idx + 1, target_length)
+            start_idx = 0
+            if end_idx - start_idx < target_length:
+                end_idx = target_length
         else:
-            return {'error': 'CUDA not available'}
-
-    def validate_model_config(self):
-        """Validate that DiT config matches VAE compression reality"""
-        # Check VAE compression factor
-        actual_compression = self.vae.compression_factor
+            raise ValueError(f"Unknown crop_strategy: {crop_strategy}")
         
-        # Get DiT expected latent size
-        dit_latent_size = self.dit.latent_size
+        cropped = video[:, :, start_idx:end_idx]
         
-        print(f"🔍 Model Configuration Validation:")
-        print(f"   VAE compression factor: {actual_compression}x")
-        print(f"   VAE latent channels: {self.vae.latent_channels}")
-        print(f"   DiT expected latent size: {dit_latent_size}")
-        print(f"   DiT hidden dim: {self.dit.hidden_dim}")
-        print(f"   DiT depth: {self.dit.depth}")
+        # Pad if necessary
+        if cropped.shape[2] < target_length:
+            pad_length = target_length - cropped.shape[2]
+            pad_tensor = cropped[:, :, -1:].repeat(1, 1, pad_length, 1, 1)
+            cropped = torch.cat([cropped, pad_tensor], dim=2)
         
-        # Validate spatial dimensions match
-        expected_spatial = 128 // actual_compression  # Assuming 128x128 input
-        dit_spatial = dit_latent_size[1] if len(dit_latent_size) > 1 else None
-        
-        if dit_spatial and dit_spatial != expected_spatial:
-            print(f"⚠️  MISMATCH: DiT expects {dit_spatial}², VAE outputs {expected_spatial}²")
-            return False
-        else:
-            print(f"✅ Configuration looks correct")
-            return True
-        
-    def training_step_completed(self):
-        """Call this after each training step"""
-        self.training_step += 1
-        
-        # Freeze VAE if needed
-        if self.training_step >= self.freeze_vae_after and not self._vae_frozen:
-            self._freeze_vae()
-        
-        # Log memory stats every 10 steps
-        if self.training_step % 10 == 0:
-            stats = self.get_memory_stats()
-            if 'allocated_gb' in stats:
-                print(f"Step {self.training_step}: {stats['allocated_gb']:.1f}GB allocated, "
-                    f"max: {stats['max_allocated_gb']:.1f}GB")
-
+        return cropped
+    
     def forward(
         self,
         video: torch.Tensor,
+        target_sequence_length: Optional[int] = None,
+        crop_strategy: str = "center",
         return_dict: bool = False
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        MEMORY-OPTIMIZED forward pass
-        - Single encode per video (no double encoding)
-        - Reuse encoded components for VAE losses
-        - Detach returned latents
+        MEMORY-OPTIMIZED forward pass with configurable sequence length
+        
+        Args:
+            video: Input video [B, C, T, H, W]
+            target_sequence_length: Optional sequence length for runtime cropping
+            crop_strategy: How to crop the sequence
+            return_dict: Whether to return loss dictionary
         """
+        # 🔧 NEW: Runtime sequence cropping
+        if target_sequence_length is not None:
+            original_video = video
+            video = self.crop_sequence_runtime(video, target_sequence_length, crop_strategy)
+            print(f"🔧 Runtime cropping: {original_video.shape} → {video.shape}")
+        
         batch_size, channels, num_frames, height, width = video.shape
         
         # Extract first and last frames for conditioning
@@ -173,167 +179,163 @@ class LungCTFLF2V(nn.Module):
         vae_losses = {}
         if self.training_step < self.freeze_vae_after and not self._vae_frozen:
             
-            # Option 1: Decode from multi-channel latent (if VAE decode is fixed)
-            try:
-                x_recon = self.vae.decode(video_latent)
-            except:
-                # Option 2: Fallback to 1-channel decode if multi-channel fails
-                x_recon = self.vae.decode_z1(z1)
+            # Reconstruction loss (reuse decoded if available)
+            if hasattr(enc_full, 'decoded') and enc_full['decoded'] is not None:
+                decoded = enc_full['decoded']
+            else:
+                decoded = self.vae.decode(video_latent)
             
-            # Compute VAE losses without re-encoding
-            loss_recon = torch.nn.functional.mse_loss(x_recon, video, reduction='mean')
-            loss_kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            vae_losses['loss_vae_recon'] = nn.functional.mse_loss(decoded, video)
+            
+            # KL divergence loss (reuse mu, logvar from encode)
+            if mu is not None and logvar is not None:
+                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                kl_loss = kl_loss / (batch_size * video_latent.numel())
+                vae_losses['loss_vae_kl'] = kl_loss
             
             # Temporal consistency loss
-            loss_temporal = torch.tensor(0.0, device=video.device)
-            if video_latent.size(2) > 1:
-                z_diff = video_latent[:, :, 1:] - video_latent[:, :, :-1]
-                loss_temporal = torch.mean(z_diff.pow(2))
-            
-            vae_losses = {
-                'loss_vae_recon': loss_recon,
-                'loss_vae_kl': loss_kl, 
-                'loss_vae_temporal': loss_temporal
-            }
+            if num_frames > 1:
+                temporal_diff = video_latent[:, :, 1:] - video_latent[:, :, :-1]
+                vae_losses['loss_vae_temporal'] = torch.mean(temporal_diff.pow(2))
         
-        # Combine all losses
+        # Combine all losses with weights
+        total_loss = 0
         all_losses = {**flow_losses, **vae_losses}
         
-        # Weighted total loss
-        total_loss = torch.tensor(0.0, device=video.device)
-        for loss_key, loss_value in all_losses.items():
-            if isinstance(loss_value, torch.Tensor):
-                weight_key = loss_key.replace('loss_', '') + '_weight'
-                weight = self.loss_weights.get(weight_key, 1.0)
-                total_loss += weight * loss_value
+        weighted_losses = {}
+        for loss_name, loss_value in all_losses.items():
+            # Map loss names to weights
+            if 'velocity' in loss_name:
+                weight = self.loss_weights['velocity_weight']
+            elif 'flf' in loss_name:
+                weight = self.loss_weights['flf_weight']
+            elif 'vae_recon' in loss_name:
+                weight = self.loss_weights['vae_recon_weight']
+            elif 'vae_kl' in loss_name:
+                weight = self.loss_weights['vae_kl_weight']
+            elif 'vae_temporal' in loss_name:
+                weight = self.loss_weights['vae_temporal_weight']
+            else:
+                weight = 1.0
+            
+            weighted_loss = weight * loss_value
+            weighted_losses[loss_name] = weighted_loss
+            total_loss += weighted_loss
+        
+        # Add total loss
+        weighted_losses['loss_total'] = total_loss
+        
+        # Increment training step and handle VAE freezing
+        self.training_step += 1
+        if self.training_step >= self.freeze_vae_after and not self._vae_frozen:
+            self._freeze_vae()
         
         if return_dict:
-            # ✅ DETACH latents to prevent memory retention
-            result = {
-                **all_losses,
-                'loss_total': total_loss,
-                'latents': {
-                    'video_latent': video_latent.detach(),      # ← DETACHED
-                    'first_latent': first_latent.detach(),      # ← DETACHED
-                    'last_latent': last_latent.detach(),        # ← DETACHED
-                }
-            }
-            return result
+            return weighted_losses
         else:
             return total_loss
-
-        def _calculate_total_loss(self, loss_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
-            """
-            Calculate weighted total loss from individual loss components
-            
-            Args:
-                loss_dict: Dictionary containing individual losses
-                
-            Returns:
-                Weighted total loss tensor
-            """
-            if not loss_dict:
-                # Return zero tensor on appropriate device
-                device = next(self.parameters()).device
-                return torch.tensor(0.0, device=device)
-            
-            # Get device from first tensor in loss_dict
-            device = next(iter(loss_dict.values())).device
-            total_loss = torch.tensor(0.0, device=device)
-            
-            # Only sum keys that start with 'loss_'
-            for key, value in loss_dict.items():
-                if key.startswith('loss_'):
-                    # Improved: handle different value types (Improvement 6)
-                    if isinstance(value, torch.Tensor):
-                        loss_tensor = value
-                    elif isinstance(value, (int, float)):
-                        loss_tensor = torch.tensor(float(value), device=device)
-                    else:
-                        continue  # Skip non-numeric values
-                    
-                    # Map loss key to weight key
-                    weight = self._get_loss_weight(key)
-                    total_loss = total_loss + weight * loss_tensor
-            
-            return total_loss
     
-    def _get_loss_weight(self, loss_key: str) -> float:
-        """Get the appropriate weight for a loss key"""
-        weight_mapping = {
-            'loss_velocity': 'velocity_weight',
-            'loss_flf': 'flf_weight',
-            'loss_vae_recon': 'vae_recon_weight',
-            'loss_vae_kl': 'vae_kl_weight',
-            'loss_vae_temporal': 'vae_temporal_weight'
-        }
-        
-        weight_key = weight_mapping.get(loss_key)
-        if weight_key and weight_key in self.loss_weights:
-            return self.loss_weights[weight_key]
-        else:
-            return 1.0  # Default weight for unknown losses
-    
-    def state_dict(self, *args, **kwargs):
-        """Include _vae_frozen state in checkpoint (Improvement 3)"""
-        state = super().state_dict(*args, **kwargs)
-        state['_vae_frozen'] = self._vae_frozen
-        state['training_step'] = self.training_step
-        return state
-    
-    def load_state_dict(self, state_dict, strict=True):
-        """Restore _vae_frozen state from checkpoint (Improvement 3)"""
-        # Extract custom state before loading
-        if '_vae_frozen' in state_dict:
-            self._vae_frozen = state_dict.pop('_vae_frozen')
-        if 'training_step' in state_dict:
-            self.training_step = state_dict.pop('training_step')
-            
-        return super().load_state_dict(state_dict, strict)
-
     @torch.no_grad()
     def generate(
         self,
         first_frame: torch.Tensor,
         last_frame: torch.Tensor,
         num_frames: int = 82,
+        target_sequence_length: Optional[int] = None,
         guidance_scale: float = 1.0,
-        decode: bool = True
+        decode: bool = True,
+        progress_bar: bool = True
     ) -> torch.Tensor:
         """
-        Generate video between first and last frames
+        Generate video sequence between first and last frames
+        FIXED: Support for configurable sequence lengths
         
         Args:
-            first_frame: First frame [B, C, H, W]
-            last_frame: Last frame [B, C, H, W]
-            num_frames: Total number of frames to generate
-            guidance_scale: CFG scale
+            first_frame: First frame [B, C, H, W] or [B, C, 1, H, W]
+            last_frame: Last frame [B, C, H, W] or [B, C, 1, H, W]
+            num_frames: Number of frames to generate (default from training)
+            target_sequence_length: Override for sequence length (for FLF2V)
+            guidance_scale: Classifier-free guidance scale
             decode: Whether to decode to pixel space
+            progress_bar: Show progress bar
         
         Returns:
-            Generated video [B, C, T, H, W] or latents
+            Generated sequence [B, C, T, H, W]
         """
-        # Add temporal dimension
-        first_frame = first_frame.unsqueeze(2)  # [B, C, 1, H, W]
-        last_frame = last_frame.unsqueeze(2)
+        # 🔧 NEW: Override num_frames if target_sequence_length specified
+        if target_sequence_length is not None:
+            num_frames = target_sequence_length
+            print(f"🔧 Using target_sequence_length: {num_frames}")
         
-        # Encode to latent
-        first_latent = self.encode_frames(first_frame)
-        last_latent = self.encode_frames(last_frame)
+        # Ensure correct input dimensions
+        if first_frame.dim() == 4:
+            first_frame = first_frame.unsqueeze(2)  # [B, C, H, W] → [B, C, 1, H, W]
+        if last_frame.dim() == 4:
+            last_frame = last_frame.unsqueeze(2)
         
-        # Generate latent video
+        print(f"🎬 Generating {num_frames} frames")
+        print(f"   Input shapes: first={first_frame.shape}, last={last_frame.shape}")
+        
+        # Encode frames to latent space
+        first_latent = self.vae.encode(first_frame)['latent']
+        last_latent = self.vae.encode(last_frame)['latent']
+        
+        print(f"   Latent shapes: first={first_latent.shape}, last={last_latent.shape}")
+        
+        # Generate latent sequence
         latent_video = self.flow_matching.sample(
-            first_latent,
-            last_latent,
+            first_frame=first_latent,
+            last_frame=last_latent,
             dit_model=self.dit,
             num_frames=num_frames,
-            guidance_scale=guidance_scale
+            guidance_scale=guidance_scale,
+            progress_bar=progress_bar
         )
         
+        print(f"   Generated latent: {latent_video.shape}")
+        
+        # Decode to pixel space if requested
         if decode:
-            # Decode to pixel space
-            video = self.decode_frames(latent_video)
-            return video
+            generated_video = self.vae.decode(latent_video)
+            print(f"   Decoded video: {generated_video.shape}")
+            return generated_video
         else:
             return latent_video
-
+    
+    def get_memory_stats(self) -> Dict[str, float]:
+        """Get current GPU memory statistics"""
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / (1024**3)  # GB
+            reserved = torch.cuda.memory_reserved() / (1024**3)    # GB
+            max_allocated = torch.cuda.max_memory_allocated() / (1024**3)  # GB
+            
+            return {
+                'allocated_gb': allocated,
+                'reserved_gb': reserved,
+                'max_allocated_gb': max_allocated,
+                'free_gb': reserved - allocated
+            }
+        return {}
+    
+    def enable_flf2v_mode(self, sequence_length: int = 41):
+        """
+        Enable FLF2V mode with shorter sequences
+        
+        Args:
+            sequence_length: Target sequence length (41 for half breathing cycle)
+        """
+        self.flf2v_mode = True
+        self.flf2v_length = sequence_length
+        print(f"✅ FLF2V mode enabled: {sequence_length} frames")
+    
+    def disable_flf2v_mode(self):
+        """Disable FLF2V mode and return to full sequences"""
+        self.flf2v_mode = False
+        self.flf2v_length = None
+        print("✅ FLF2V mode disabled: full sequences")
+    
+    def get_effective_sequence_length(self, default_length: int = 82) -> int:
+        """Get the effective sequence length based on current mode"""
+        if hasattr(self, 'flf2v_mode') and self.flf2v_mode:
+            return self.flf2v_length
+        return default_length
