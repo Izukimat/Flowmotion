@@ -370,9 +370,9 @@ class LungCTDiT(nn.Module):
 
         # Validate latent_size matches compression reality
         T, H, W = latent_size
-        assert H == W, f"Expected square spatial dims, got {H}x{W}"
-        assert H in [16, 32, 64], f"Expected H in [16,32,64] for 4x VAE, got {H}"
-        
+        min_size, max_size = 16, 256
+        assert min_size <= H <= max_size, f"Expected H in [{min_size},{max_size}] for 4x VAE, got {H}"
+                
         self.latent_channels = latent_channels
         self.latent_size = latent_size
         self.hidden_dim = hidden_dim
