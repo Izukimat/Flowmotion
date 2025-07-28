@@ -356,15 +356,22 @@ class LungCTDiT(nn.Module):
     
     def __init__(
         self,
-        latent_channels: int = 8,
-        latent_size: Tuple[int, int, int] = (5, 16, 16),  # After 8x compression of 40x128x128
-        hidden_dim: int = 768,  # Reduced from typical 1024-1280
-        depth: int = 24,  # 24 layers -> ~0.6B params
-        num_heads: int = 12,
+        latent_channels: int = 4,
+        latent_size: Tuple[int, int, int] = (21, 32, 32),  # After 8x compression of 40x128x128
+        hidden_dim: int = 384,  # Reduced from typical 1024-1280
+        depth: int = 12,  # 24 layers -> ~0.6B params
+        num_heads: int = 6,
         mlp_ratio: float = 4.0,
-        dropout: float = 0.1
+        dropout: float = 0.05,
+        use_rope: bool = True,
+        gradient_checkpointing: bool = True
     ):
         super().__init__()
+
+        # Validate latent_size matches compression reality
+        T, H, W = latent_size
+        assert H == W, f"Expected square spatial dims, got {H}x{W}"
+        assert H in [16, 32, 64], f"Expected H in [16,32,64] for 4x VAE, got {H}"
         
         self.latent_channels = latent_channels
         self.latent_size = latent_size
@@ -517,12 +524,19 @@ class SinusoidalPosEmb(nn.Module):
 
 def create_dit_model(config: Dict) -> LungCTDiT:
     """Factory function to create DiT model from config"""
-    return LungCTDiT(
-        latent_channels=config.get('latent_channels', 8),
-        latent_size=config.get('latent_size', (5, 16, 16)),
-        hidden_dim=config.get('hidden_dim', 768),
-        depth=config.get('depth', 24),
-        num_heads=config.get('num_heads', 12),
-        mlp_ratio=config.get('mlp_ratio', 4.0),
-        dropout=config.get('dropout', 0.1),
-    )
+    default_config = {
+        'latent_channels': 4,           # ← REDUCED from 8 to 4
+        'latent_size': [21, 32, 32],    # ← CORRECTED from [21, 16, 16] to [21, 32, 32]
+        'hidden_dim': 384,              # ← REDUCED from 512+ to 384 for memory
+        'depth': 12,                    # ← REDUCED from 24 to 12 for memory
+        'num_heads': 6,                 # ← REDUCED accordingly
+        'mlp_ratio': 4.0,
+        'dropout': 0.05,
+        'use_rope': True,
+        'gradient_checkpointing': True  # ← KEEP enabled for memory savings
+    }
+    
+    # Merge with user config
+    final_config = {**default_config, **config}
+    
+    return LungCTDiT(**final_config)

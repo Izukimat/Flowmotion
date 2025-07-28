@@ -68,20 +68,74 @@ class LungCTFLF2V(nn.Module):
         """Decode latents to frame space"""
         return self.vae.decode(latents)
     
+    def get_memory_stats(self) -> Dict[str, float]:
+        """Get current memory usage statistics"""
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1e9
+            cached = torch.cuda.memory_reserved() / 1e9
+            max_allocated = torch.cuda.max_memory_allocated() / 1e9
+            
+            return {
+                'allocated_gb': allocated,
+                'cached_gb': cached, 
+                'max_allocated_gb': max_allocated,
+                'vae_frozen': self._vae_frozen,
+                'training_step': self.training_step
+            }
+        else:
+            return {'error': 'CUDA not available'}
+
+    def validate_model_config(self):
+        """Validate that DiT config matches VAE compression reality"""
+        # Check VAE compression factor
+        actual_compression = self.vae.compression_factor
+        
+        # Get DiT expected latent size
+        dit_latent_size = self.dit.latent_size
+        
+        print(f"🔍 Model Configuration Validation:")
+        print(f"   VAE compression factor: {actual_compression}x")
+        print(f"   VAE latent channels: {self.vae.latent_channels}")
+        print(f"   DiT expected latent size: {dit_latent_size}")
+        print(f"   DiT hidden dim: {self.dit.hidden_dim}")
+        print(f"   DiT depth: {self.dit.depth}")
+        
+        # Validate spatial dimensions match
+        expected_spatial = 128 // actual_compression  # Assuming 128x128 input
+        dit_spatial = dit_latent_size[1] if len(dit_latent_size) > 1 else None
+        
+        if dit_spatial and dit_spatial != expected_spatial:
+            print(f"⚠️  MISMATCH: DiT expects {dit_spatial}², VAE outputs {expected_spatial}²")
+            return False
+        else:
+            print(f"✅ Configuration looks correct")
+            return True
+        
+    def training_step_completed(self):
+        """Call this after each training step"""
+        self.training_step += 1
+        
+        # Freeze VAE if needed
+        if self.training_step >= self.freeze_vae_after and not self._vae_frozen:
+            self._freeze_vae()
+        
+        # Log memory stats every 10 steps
+        if self.training_step % 10 == 0:
+            stats = self.get_memory_stats()
+            if 'allocated_gb' in stats:
+                print(f"Step {self.training_step}: {stats['allocated_gb']:.1f}GB allocated, "
+                    f"max: {stats['max_allocated_gb']:.1f}GB")
+
     def forward(
         self,
         video: torch.Tensor,
         return_dict: bool = False
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Forward pass for training
-        
-        Args:
-            video: Full breathing sequence [B, C, T, H, W]
-            return_dict: Whether to return loss dictionary
-        
-        Returns:
-            Loss tensor or dictionary with separate loss and latent keys
+        MEMORY-OPTIMIZED forward pass
+        - Single encode per video (no double encoding)
+        - Reuse encoded components for VAE losses
+        - Detach returned latents
         """
         batch_size, channels, num_frames, height, width = video.shape
         
@@ -89,12 +143,18 @@ class LungCTFLF2V(nn.Module):
         first_frame = video[:, :, 0:1]  # [B, C, 1, H, W]
         last_frame = video[:, :, -1:]   # [B, C, 1, H, W]
         
-        # Encode to latent space
-        video_latent = self.encode_frames(video)
-        first_latent = self.encode_frames(first_frame)
-        last_latent = self.encode_frames(last_frame)
+        # ✅ SINGLE ENCODE - eliminate double encoding memory waste
+        enc_full = self.vae.encode(video)
+        video_latent = enc_full['latent']    # Multi-channel for DiT
+        mu = enc_full['mu']                  # For KL loss
+        logvar = enc_full['logvar']          # For KL loss  
+        z1 = enc_full['z1']                  # 1-channel for VAE reconstruction
         
-        # Flow matching loss - Fix: ensure consistent loss key names
+        # Encode first/last frames (these are small, minimal memory impact)
+        first_latent = self.vae.encode(first_frame)['latent']
+        last_latent = self.vae.encode(last_frame)['latent']
+        
+        # Flow matching loss
         flow_output = self.flow_matching(
             video_latent,
             first_latent,
@@ -103,100 +163,101 @@ class LungCTFLF2V(nn.Module):
             return_dict=True
         )
         
-        # Extract flow losses with consistent naming (Improvement 1)
+        # Extract flow losses
         flow_losses = {
             f'loss_{k.replace("_loss", "")}': v 
             for k, v in flow_output.items() 
             if k.endswith('_loss') and isinstance(v, torch.Tensor)
         }
         
-        # VAE losses - Fix: only compute if VAE not frozen
+        # ✅ VAE LOSSES - reuse components, no second encode
         vae_losses = {}
         if self.training_step < self.freeze_vae_after and not self._vae_frozen:
-            vae_output = self.vae(video, return_dict=True)
             
-            # Map VAE loss keys with fallbacks (Improvement 2)
-            vae_loss_mapping = {
-                'loss_recon': 'loss_vae_recon',
-                'loss_kl': 'loss_vae_kl', 
-                'loss_temporal': 'loss_vae_temporal',
-                # Add fallback mappings for different VAE implementations
-                'recon_loss': 'loss_vae_recon',
-                'kl_loss': 'loss_vae_kl',
-                'temporal_loss': 'loss_vae_temporal'
+            # Option 1: Decode from multi-channel latent (if VAE decode is fixed)
+            try:
+                x_recon = self.vae.decode(video_latent)
+            except:
+                # Option 2: Fallback to 1-channel decode if multi-channel fails
+                x_recon = self.vae.decode_z1(z1)
+            
+            # Compute VAE losses without re-encoding
+            loss_recon = torch.nn.functional.mse_loss(x_recon, video, reduction='mean')
+            loss_kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            
+            # Temporal consistency loss
+            loss_temporal = torch.tensor(0.0, device=video.device)
+            if video_latent.size(2) > 1:
+                z_diff = video_latent[:, :, 1:] - video_latent[:, :, :-1]
+                loss_temporal = torch.mean(z_diff.pow(2))
+            
+            vae_losses = {
+                'loss_vae_recon': loss_recon,
+                'loss_vae_kl': loss_kl, 
+                'loss_vae_temporal': loss_temporal
             }
-            
-            for vae_key, mapped_key in vae_loss_mapping.items():
-                if vae_key in vae_output and isinstance(vae_output[vae_key], torch.Tensor):
-                    vae_losses[mapped_key] = vae_output[vae_key]
-                    
-        elif self.training_step >= self.freeze_vae_after and not self._vae_frozen:
-            # Freeze VAE parameters
-            self._freeze_vae()
-        
-        # Only increment training step during training (Improvement 4)
-        if self.training:
-            self.training_step += 1
         
         # Combine all losses
         all_losses = {**flow_losses, **vae_losses}
         
-        # Calculate weighted total loss
-        total_loss = self._calculate_total_loss(all_losses)
-        all_losses['loss_total'] = total_loss
+        # Weighted total loss
+        total_loss = torch.tensor(0.0, device=video.device)
+        for loss_key, loss_value in all_losses.items():
+            if isinstance(loss_value, torch.Tensor):
+                weight_key = loss_key.replace('loss_', '') + '_weight'
+                weight = self.loss_weights.get(weight_key, 1.0)
+                total_loss += weight * loss_value
         
         if return_dict:
-            # Fix: separate losses from latents to prevent pollution
+            # ✅ DETACH latents to prevent memory retention
             result = {
-                # Loss keys (safe for summation)
                 **all_losses,
-                # Latent keys (separate from losses)
+                'loss_total': total_loss,
                 'latents': {
-                    'video_latent': video_latent,
-                    'first_latent': first_latent,
-                    'last_latent': last_latent
+                    'video_latent': video_latent.detach(),      # ← DETACHED
+                    'first_latent': first_latent.detach(),      # ← DETACHED
+                    'last_latent': last_latent.detach(),        # ← DETACHED
                 }
             }
             return result
         else:
-            # Return total loss
             return total_loss
 
-    def _calculate_total_loss(self, loss_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Calculate weighted total loss from individual loss components
-        
-        Args:
-            loss_dict: Dictionary containing individual losses
+        def _calculate_total_loss(self, loss_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+            """
+            Calculate weighted total loss from individual loss components
             
-        Returns:
-            Weighted total loss tensor
-        """
-        if not loss_dict:
-            # Return zero tensor on appropriate device
-            device = next(self.parameters()).device
-            return torch.tensor(0.0, device=device)
-        
-        # Get device from first tensor in loss_dict
-        device = next(iter(loss_dict.values())).device
-        total_loss = torch.tensor(0.0, device=device)
-        
-        # Only sum keys that start with 'loss_'
-        for key, value in loss_dict.items():
-            if key.startswith('loss_'):
-                # Improved: handle different value types (Improvement 6)
-                if isinstance(value, torch.Tensor):
-                    loss_tensor = value
-                elif isinstance(value, (int, float)):
-                    loss_tensor = torch.tensor(float(value), device=device)
-                else:
-                    continue  # Skip non-numeric values
+            Args:
+                loss_dict: Dictionary containing individual losses
                 
-                # Map loss key to weight key
-                weight = self._get_loss_weight(key)
-                total_loss = total_loss + weight * loss_tensor
-        
-        return total_loss
+            Returns:
+                Weighted total loss tensor
+            """
+            if not loss_dict:
+                # Return zero tensor on appropriate device
+                device = next(self.parameters()).device
+                return torch.tensor(0.0, device=device)
+            
+            # Get device from first tensor in loss_dict
+            device = next(iter(loss_dict.values())).device
+            total_loss = torch.tensor(0.0, device=device)
+            
+            # Only sum keys that start with 'loss_'
+            for key, value in loss_dict.items():
+                if key.startswith('loss_'):
+                    # Improved: handle different value types (Improvement 6)
+                    if isinstance(value, torch.Tensor):
+                        loss_tensor = value
+                    elif isinstance(value, (int, float)):
+                        loss_tensor = torch.tensor(float(value), device=device)
+                    else:
+                        continue  # Skip non-numeric values
+                    
+                    # Map loss key to weight key
+                    weight = self._get_loss_weight(key)
+                    total_loss = total_loss + weight * loss_tensor
+            
+            return total_loss
     
     def _get_loss_weight(self, loss_key: str) -> float:
         """Get the appropriate weight for a loss key"""

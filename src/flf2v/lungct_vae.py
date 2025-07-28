@@ -97,7 +97,9 @@ class LungCTVAE(nn.Module):
             z, mu, logvar = self._encode_2d_chunked(x2d, chunk_size=8)
         else:
             z, mu, logvar = self._encode_2d(x2d)
-        
+
+        # Keep original 1-channel z for VAE losses (ADDITION for memory fix)
+        z1_original = z.clone() 
         # Rest of the processing remains the same...
         if self.latent_channels != 1:
             z = self.channel_exp(z)
@@ -110,7 +112,9 @@ class LungCTVAE(nn.Module):
         mu = mu.view(B, T, 1, h, w).permute(0,2,1,3,4)
         logvar = logvar.view(B, T, 1, h, w).permute(0,2,1,3,4)
         
-        return {"latent": z, "mu": mu, "logvar": logvar, "z1": z}
+        z1_original = z1_original.view(B, T, 1, h, w).permute(0,2,1,3,4)
+
+        return {"latent": z, "mu": mu, "logvar": logvar, "z1": z1_original}
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         B, C, T, h, w = z.shape
@@ -118,15 +122,33 @@ class LungCTVAE(nn.Module):
             z = torch.atanh(torch.clamp(z, -0.999, 0.999))
             z = (z - self.latent_shift) / self.latent_scale
 
-        z2d = z.permute(0,2,1,3,4).reshape(B*T, 1, h, w)
+        z2d = z.permute(0,2,1,3,4).reshape(B*T, C, h, w)
         if self.latent_channels != 1:
-            z = self.channel_red(z)
+            z2d = self.channel_red(z)
 
         recon2d = self.base_vae.decode(z2d)                      # (B·T,1,H,W)
         H, W = recon2d.shape[-2:]
         recon = recon2d.view(B, T, 1, H, W).permute(0,2,1,3,4)   # (B,1,T,H,W)
         return recon
-    
+
+    def decode_z1(self, z1: torch.Tensor) -> torch.Tensor:
+        """Decode from 1-channel latent (for VAE loss computation)"""
+        B, C, T, h, w = z1.shape  # C should be 1
+        assert C == 1, f"Expected 1-channel input, got {C}"
+        
+        if self.use_tanh_scaling:
+            z1 = torch.atanh(torch.clamp(z1, -0.999, 0.999))
+            z1 = (z1 - self.latent_shift) / self.latent_scale
+        
+        # Reshape to 4D for base VAE
+        z2d = z1.permute(0,2,1,3,4).reshape(B*T, 1, h, w)  # [B*T, 1, h, w]
+        
+        # Direct decode (no channel reduction needed)
+        recon2d = self.base_vae.decode(z2d)                      # (B·T,1,H,W)
+        H, W = recon2d.shape[-2:]
+        recon = recon2d.view(B, T, 1, H, W).permute(0,2,1,3,4)   # (B,1,T,H,W)
+        return recon
+
     def forward(
         self, 
         x: torch.Tensor, 
@@ -269,3 +291,20 @@ class VAELoss(nn.Module):
         losses['total'] = sum(losses.values())
         
         return losses
+    
+def validate_dit_config_for_vae(vae_compression_factor: int, input_size: int, dit_config: Dict):
+    """Validate DiT config matches VAE reality"""
+    expected_latent_spatial = input_size // vae_compression_factor
+    
+    dit_spatial = dit_config['latent_size'][1]  # Assuming [T, H, W]
+    
+    if dit_spatial != expected_latent_spatial:
+        print(f"⚠️  DiT config mismatch!")
+        print(f"   VAE {vae_compression_factor}x compression on {input_size}² → {expected_latent_spatial}²")
+        print(f"   DiT config expects {dit_spatial}²")
+        print(f"   Updating DiT config...")
+        
+        dit_config['latent_size'][1] = expected_latent_spatial
+        dit_config['latent_size'][2] = expected_latent_spatial
+    
+    return dit_config
