@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Training script for Lung CT FLF2V model - Fixed version
-Addresses all critical issues: proper imports, loss handling, schedulers, etc.
+Training script for Lung CT FLF2V model - Fixed version with debugging
+Addresses all critical issues: proper imports, loss handling, schedulers, debugging
 """
 
 import argparse
@@ -47,6 +47,44 @@ def setup_distributed():
         return 0, 1, 0
 
 
+def setup_cuda_optimizations():
+    """Setup CUDA-specific optimizations"""
+    # Enable TensorFloat-32 (faster on H100)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Optimize memory allocation
+    torch.cuda.empty_cache()
+    
+    # Set memory allocation strategy
+    import os
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
+    # Enable cudnn optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False  # Faster but less reproducible
+
+
+def check_model_health(model, step):
+    """Check for NaN/Inf in model parameters"""
+    nan_params = []
+    inf_params = []
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            if torch.isnan(param).any():
+                nan_params.append(name)
+            if torch.isinf(param).any():
+                inf_params.append(name)
+    
+    if nan_params or inf_params:
+        logging.error(f"❌ Step {step}: Model corruption detected!")
+        logging.error(f"   NaN params: {nan_params}")
+        logging.error(f"   Inf params: {inf_params}")
+        return False
+    return True
+
+
 def create_model(config: Dict, device: str) -> LungCTFLF2V:
     """Create model from config"""
     # Create VAE
@@ -61,57 +99,145 @@ def create_model(config: Dict, device: str) -> LungCTFLF2V:
     # Create DiT
     dit = create_dit_model(config['model']['dit_config'])
     
-    # Create Flow Matching - Fix: proper config handling and no DiT duplication
-    # fm_config = FlowMatchingConfig(**)
+    # Create Flow Matching
     flow_matching = create_flow_matching_model({'config': config['model']['flow_matching_config']})
     
-    # Create full model
+    # Create full model with loss weights
+    loss_weights = {
+        'velocity_weight': config['training'].get('velocity_weight', 1.0),
+        'flf_weight': config['training'].get('flf_weight', 0.1),
+        'vae_recon_weight': config['training'].get('vae_recon_weight', 1.0),
+        'vae_kl_weight': config['training'].get('vae_kl_weight', 0.01),
+        'vae_temporal_weight': config['training'].get('vae_temporal_weight', 0.1)
+    }
+    
     model = LungCTFLF2V(
         vae=vae,
         dit=dit,
         flow_matching=flow_matching,
-        freeze_vae_after=config['model']['freeze_vae_after']
+        freeze_vae_after=config['model']['freeze_vae_after'],
+        loss_weights=loss_weights
     )
     
     return model.to(device)
 
 
-def get_loss_weights(config: Dict) -> Dict[str, float]:
-    """Get loss weights with defaults"""
-    training_config = config.get('training', {})
-    return {
-        'velocity_weight': training_config.get('velocity_weight', 1.0),
-        'flf_weight': training_config.get('flf_weight', 0.1),
-        'vae_recon_weight': training_config.get('vae_recon_weight', 1.0),
-        'vae_kl_weight': training_config.get('vae_kl_weight', 0.01),
-        'vae_temporal_weight': training_config.get('vae_temporal_weight', 0.1)
-    }
-
-
-def calculate_weighted_loss(loss_dict: Dict, weights: Dict[str, float], device: str) -> torch.Tensor:
-    """Calculate weighted total loss - only sum loss keys"""
-    total_loss = torch.tensor(0.0, device=device)
+def debug_training_step(model, batch, vae_optimizer, dit_optimizer, scaler, step, config, device):
+    """Debug version of training step with comprehensive checks"""
     
-    # Only sum keys that start with 'loss_'
-    for key, value in loss_dict.items():
-        if key.startswith('loss_') and isinstance(value, torch.Tensor):
-            # Map loss key to weight key
-            if key == 'loss_velocity':
-                weight = weights['velocity_weight']
-            elif key == 'loss_flf':
-                weight = weights['flf_weight']
-            elif key == 'loss_vae_recon':
-                weight = weights['vae_recon_weight']
-            elif key == 'loss_vae_kl':
-                weight = weights['vae_kl_weight']
-            elif key == 'loss_vae_temporal':
-                weight = weights['vae_temporal_weight']
-            else:
-                weight = 1.0  # Default weight for unknown losses
+    # Extract video data
+    if 'video' in batch:
+        video = batch['video'].to(device, memory_format=torch.channels_last)
+    elif 'target_frames' in batch:
+        video = batch['target_frames'].to(device, memory_format=torch.channels_last)
+    else:
+        raise KeyError("Batch must contain either 'video' or 'target_frames'")
+    
+    # Check input data
+    if torch.isnan(video).any() or torch.isinf(video).any():
+        logging.error(f"❌ Step {step}: NaN/Inf in input data!")
+        return None
+    
+    # Forward pass with debugging
+    try:
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            losses = model(video, return_dict=True)
+        
+        # Check all loss components
+        total_loss = None
+        valid_losses = {}
+        
+        for key, value in losses.items():
+            if isinstance(value, torch.Tensor):
+                if torch.isnan(value).any() or torch.isinf(value).any():
+                    logging.error(f"  ❌ {key}: {value} (CORRUPTED)")
+                    return None
+                else:
+                    valid_losses[key] = value.item()
+                    if key == 'loss_total':
+                        total_loss = value
+        
+        if total_loss is None or total_loss.item() == 0:
+            logging.error(f"❌ Step {step}: Invalid total loss: {total_loss}")
+            return None
+        
+        # Log losses every 10 steps
+        if step % 10 == 0:
+            loss_str = ", ".join([f"{k}: {v:.6f}" for k, v in valid_losses.items()])
+            logging.info(f"Step {step} - {loss_str}")
+        
+        # Backward pass
+        scaler.scale(total_loss).backward()
+        
+        # Gradient accumulation check
+        if (step + 1) % config['training']['gradient_accumulation_steps'] == 0:
+            # Unscale gradients for clipping
+            model_ref = model.module if hasattr(model, 'module') else model
             
-            total_loss = total_loss + weight * value
-    
-    return total_loss
+            if dit_optimizer is not None:
+                scaler.unscale_(dit_optimizer)
+            if vae_optimizer is not None and not model_ref._vae_frozen:
+                scaler.unscale_(vae_optimizer)
+            
+            # Check gradients before clipping
+            total_norm = 0
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        logging.error(f"❌ Step {step}: NaN/Inf gradient in {name}")
+                        return None
+            
+            total_norm = total_norm ** (1. / 2)
+            
+            # Clip gradients
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), 
+                config['training']['grad_clip']
+            )
+            
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                logging.error(f"❌ Step {step}: Invalid gradient norm: {grad_norm}")
+                return None
+            
+            # Log gradient norm every 50 steps
+            if step % 50 == 0:
+                logging.info(f"Step {step}: Gradient norm: {grad_norm:.6f}")
+            
+            # Optimizer steps
+            if dit_optimizer is not None:
+                scaler.step(dit_optimizer)
+            if vae_optimizer is not None and not model_ref._vae_frozen:
+                scaler.step(vae_optimizer)
+            
+            scaler.update()
+            
+            # Zero gradients
+            if dit_optimizer is not None:
+                dit_optimizer.zero_grad(set_to_none=True)
+            if vae_optimizer is not None:
+                vae_optimizer.zero_grad(set_to_none=True)
+            
+            # Check model health after update
+            if not check_model_health(model, step):
+                return None
+        
+        return valid_losses
+        
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            logging.error(f"❌ Step {step}: CUDA OOM: {e}")
+            torch.cuda.empty_cache()
+        else:
+            logging.error(f"❌ Step {step}: Runtime error: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"❌ Step {step}: Exception during training: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 
 def train_epoch(
     model: LungCTFLF2V,
@@ -126,7 +252,7 @@ def train_epoch(
     device: str,
     use_wandb: bool = False
 ) -> Dict[str, float]:
-    """Memory-optimized training epoch"""
+    """Memory-optimized training epoch with debugging"""
     model.train()
     losses = defaultdict(list)
     
@@ -134,81 +260,45 @@ def train_epoch(
     model_ref = model.module if hasattr(model, 'module') else model
     if model_ref.training_step >= model_ref.freeze_vae_after:
         model_ref._freeze_vae()
-        vae_optimizer = None  # No need to update frozen params
+        logging.info(f"VAE frozen at step {model_ref.training_step}")
     
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
     for batch_idx, batch in enumerate(progress_bar):
-        # Move batch data to device
-        if 'video' in batch:
-            video = batch['video'].to(device)  # [B, 1, T, H, W]
-        elif 'target_frames' in batch:
-            video = batch['target_frames'].to(device)
-        else:
-            raise KeyError("Batch must contain either 'video' or 'target_frames'")
+        # Debug training step
+        step_losses = debug_training_step(
+            model, batch, vae_optimizer, dit_optimizer, 
+            scaler, model_ref.training_step, config, device
+        )
         
-        # Extract first and last frames from the video sequence
-        B, C, T, H, W = video.shape
+        if step_losses is None:
+            logging.error(f"❌ Training failed at step {model_ref.training_step}. Stopping epoch.")
+            break
         
-        # Forward pass with autocast
-        with torch.amp.autocast(device_type='cuda',dtype=torch.bfloat16):
-            # Get all losses from the model
-            all_losses = model_ref(
-                video=video,
-                return_dict=True
-            )
-            
-            # Extract individual losses
-            total_loss = all_losses['loss_total']
-            
-            # Record losses
-            for key, value in all_losses.items():
-                if isinstance(value, torch.Tensor):
-                    losses[key].append(value.item())
+        # Record losses
+        for key, value in step_losses.items():
+            losses[key].append(value)
         
-        # Backward pass
-        scaler.scale(total_loss).backward()
-        
-        # Gradient accumulation
-        if (batch_idx + 1) % config['training']['gradient_accumulation_steps'] == 0:
-            # Unscale gradients
-            if dit_optimizer is not None:
-                scaler.unscale_(dit_optimizer)
-            if vae_optimizer is not None and not model_ref._vae_frozen:
-                scaler.unscale_(vae_optimizer)
-            
-            # Clip gradients
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), 
-                config['training']['grad_clip']
-            )
-            
-            # Update weights
-            if dit_optimizer is not None:
-                scaler.step(dit_optimizer)
-            if vae_optimizer is not None and not model_ref._vae_frozen:
-                scaler.step(vae_optimizer)
-            
-            scaler.update()
-            
-            # Zero gradients
-            if dit_optimizer is not None:
-                dit_optimizer.zero_grad(set_to_none=True)
-            if vae_optimizer is not None:
-                vae_optimizer.zero_grad(set_to_none=True)
-        
-        # Update progress bar
+        # Update progress bar with current loss
+        current_loss = step_losses.get('loss_total', 0)
         progress_bar.set_postfix({
-            'loss': np.mean(losses['total'][-10:]) if losses['total'] else 0,
-            'mem_gb': torch.cuda.max_memory_allocated() / 1e9
+            'loss': f"{current_loss:.6f}",
+            'mem_gb': torch.cuda.memory_allocated() / 1e9
         })
         
         # Increment training step
         model_ref.training_step += 1
         
-        # Clear cache periodically
-        if batch_idx % 10 == 0:
+        # Memory cleanup every 50 steps
+        if batch_idx % 50 == 0:
             torch.cuda.empty_cache()
+            
+        # Emergency break if loss becomes 0 consistently
+        if len(losses['loss_total']) > 10:
+            recent_losses = losses['loss_total'][-10:]
+            if all(l < 1e-6 for l in recent_losses):
+                logging.error("❌ Loss has been 0 for 10 consecutive steps. Stopping training.")
+                break
     
     # Step schedulers
     if vae_scheduler is not None:
@@ -220,7 +310,7 @@ def train_epoch(
     avg_losses = {k: np.mean(v) for k, v in losses.items() if v}
     
     # Log to wandb
-    if use_wandb:
+    if use_wandb and avg_losses:
         wandb.log({f'train/{k}': v for k, v in avg_losses.items()}, step=epoch)
         wandb.log({
             'train/lr_vae': vae_optimizer.param_groups[0]['lr'] if vae_optimizer else 0,
@@ -238,7 +328,7 @@ def validate_epoch(
     device,
     use_wandb=False
 ):
-    """Validate one epoch - Fixed to handle actual data structure"""
+    """Validate one epoch"""
     model.eval()
     losses = defaultdict(list)
     
@@ -246,33 +336,33 @@ def validate_epoch(
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=f"Val Epoch {epoch}"):
-            # Move batch data to device
-            if 'video' in batch:
-                video = batch['video'].to(device)
-            elif 'target_frames' in batch:
-                video = batch['target_frames'].to(device)
-            else:
-                raise KeyError("Batch must contain either 'video' or 'target_frames'")
-            
-            B, C, T, H, W = video.shape
-            
-            # Forward pass
-            with torch.amp.autocast(device_type='cuda',dtype=torch.bfloat16):
-                all_losses = model_ref(
-                    video=video,
-                    return_dict=True
-                )
+            try:
+                # Move batch data to device
+                if 'video' in batch:
+                    video = batch['video'].to(device, memory_format=torch.channels_last)
+                elif 'target_frames' in batch:
+                    video = batch['target_frames'].to(device, memory_format=torch.channels_last)
+                else:
+                    continue
                 
-                # Record losses
-                for key, value in all_losses.items():
-                    if isinstance(value, torch.Tensor):
-                        losses[key].append(value.item())
+                # Forward pass
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    all_losses = model_ref(video, return_dict=True)
+                    
+                    # Record losses
+                    for key, value in all_losses.items():
+                        if isinstance(value, torch.Tensor) and not (torch.isnan(value) or torch.isinf(value)):
+                            losses[key].append(value.item())
+            
+            except Exception as e:
+                logging.warning(f"Validation batch failed: {e}")
+                continue
     
     # Average losses
     avg_losses = {k: np.mean(v) for k, v in losses.items() if v}
     
     # Log to wandb
-    if use_wandb:
+    if use_wandb and avg_losses:
         wandb.log({f'val/{k}': v for k, v in avg_losses.items()}, step=epoch)
     
     return avg_losses
@@ -297,6 +387,9 @@ def main():
     parser.add_argument('--distributed', action='store_true', help='Use distributed training')
     args = parser.parse_args()
     
+    # Setup CUDA optimizations
+    setup_cuda_optimizations()
+    
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
@@ -310,6 +403,10 @@ def main():
         level=logging.INFO,
         format=f'[Rank {rank}] %(asctime)s - %(levelname)s - %(message)s'
     )
+    
+    logging.info(f"🚀 Starting training with config: {args.config}")
+    logging.info(f"📊 Batch size: {config['training']['batch_size']}")
+    logging.info(f"🔧 Latent channels: {config['model']['latent_channels']}")
     
     # Setup output directory
     output_dir = Path(args.output_dir)
@@ -333,7 +430,7 @@ def main():
         csv_file=args.csv_file,
         split='train',
         data_root=args.data_root,
-        augment=True,
+        augment=config['data'].get('augmentation', {}).get('enable_augmentation', True),
         normalize=True,
         load_target_frames=True
     )
@@ -347,6 +444,9 @@ def main():
         load_target_frames=True
     )
     
+    logging.info(f"📚 Loaded {len(train_dataset)} train samples")
+    logging.info(f"📚 Loaded {len(val_dataset)} val samples")
+    
     # Create dataloaders
     train_sampler = DistributedSampler(train_dataset) if args.distributed else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if args.distributed else None
@@ -359,7 +459,9 @@ def main():
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         pin_memory=True,
-        collate_fn=lungct_collate_fn
+        collate_fn=lungct_collate_fn,
+        persistent_workers=True,
+        drop_last=True  # For compilation stability
     )
     
     val_loader = DataLoader(
@@ -370,38 +472,26 @@ def main():
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         pin_memory=True,
-        collate_fn=lungct_collate_fn
+        collate_fn=lungct_collate_fn,
+        persistent_workers=True
     )
     
     # Create model
     model = create_model(config, device)
-    if config['training'].get('compile_model', True):
-        logging.info("🚀 Compiling model components for H100...")
-        
-        # Get model reference (before potential DDP wrapping)
-        model_ref = model
-        
-        # Compile the most compute-intensive component (DiT)
+    
+    # Apply torch.compile if enabled
+    if config['training'].get('compile_model', False):
+        logging.info("🚀 Compiling model components for speed...")
         try:
-            model_ref.dit = torch.compile(
-                model_ref.dit,
-                mode='max-autotune',  # Best for H100
-                fullgraph=True
+            model.dit = torch.compile(
+                model.dit,
+                mode='default',  # Start conservative for stability
+                fullgraph=False
             )
             logging.info("✅ DiT compiled successfully")
         except Exception as e:
             logging.warning(f"⚠️ DiT compilation failed: {e}, proceeding without compilation")
-        
-        # Optionally compile VAE components (more conservative)
-        try:
-            if hasattr(model_ref.vae, 'encoder'):
-                model_ref.vae.encoder = torch.compile(model_ref.vae.encoder, mode='default')
-            if hasattr(model_ref.vae, 'decoder'):
-                model_ref.vae.decoder = torch.compile(model_ref.vae.decoder, mode='default')
-            logging.info("✅ VAE components compiled successfully")
-        except Exception as e:
-            logging.warning(f"⚠️ VAE compilation failed: {e}, proceeding without compilation")
-            
+    
     if args.distributed:
         model = DDP(model, device_ids=[local_rank])
     
@@ -421,17 +511,32 @@ def main():
     )
     
     # Add LR schedulers
-    vae_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        vae_optimizer, 
-        T_max=config['training'].get('num_epochs', 100)
-    )
-    dit_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        dit_optimizer,
-        T_max=config['training'].get('num_epochs', 100)
-    )
+    scheduler_type = config['training'].get('scheduler_type', 'cosine')
+    if scheduler_type == 'cosine':
+        vae_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            vae_optimizer, 
+            T_max=config['training'].get('num_epochs', 100)
+        )
+        dit_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            dit_optimizer,
+            T_max=config['training'].get('num_epochs', 100)
+        )
+    else:  # linear
+        vae_scheduler = optim.lr_scheduler.LinearLR(
+            vae_optimizer,
+            start_factor=1.0,
+            end_factor=0.1,
+            total_iters=config['training'].get('num_epochs', 100)
+        )
+        dit_scheduler = optim.lr_scheduler.LinearLR(
+            dit_optimizer,
+            start_factor=1.0,
+            end_factor=0.1,
+            total_iters=config['training'].get('num_epochs', 100)
+        )
     
     # Setup mixed precision
-    scaler = GradScaler(enabled=True)
+    scaler = GradScaler(enabled=config['training'].get('mixed_precision', True))
     
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -463,14 +568,22 @@ def main():
             scaler, epoch, config, device, not args.no_wandb
         )
         
+        # Check if training failed
+        if not train_losses or train_losses.get('loss_total', 0) == 0:
+            logging.error("❌ Training failed. Exiting.")
+            break
+        
         # Validate
         if epoch % config['training'].get('val_freq', 5) == 0:
             val_losses = validate_epoch(
                 model, val_loader, epoch, config, device, not args.no_wandb
             )
             
-            logging.info(f"Epoch {epoch}: Train Loss: {train_losses['total']:.4f}, "
-                        f"Val Loss: {val_losses['total']:.4f}")
+            if val_losses:
+                logging.info(f"Epoch {epoch}: Train Loss: {train_losses.get('loss_total', 0):.6f}, "
+                            f"Val Loss: {val_losses.get('loss_total', 0):.6f}")
+            else:
+                logging.info(f"Epoch {epoch}: Train Loss: {train_losses.get('loss_total', 0):.6f}")
         
         # Save checkpoint
         if rank == 0 and epoch % config['training'].get('save_freq', 10) == 0:
@@ -489,7 +602,7 @@ def main():
             
             checkpoint_path = output_dir / f'checkpoint_epoch_{epoch}.pt'
             torch.save(checkpoint, checkpoint_path)
-            logging.info(f"Saved checkpoint: {checkpoint_path}")
+            logging.info(f"💾 Saved checkpoint: {checkpoint_path}")
     
     # Save final model
     if rank == 0:
@@ -498,7 +611,7 @@ def main():
             'model_state_dict': model.module.state_dict() if args.distributed else model.state_dict(),
             'config': config
         }, final_path)
-        logging.info(f"Saved final model: {final_path}")
+        logging.info(f"💾 Saved final model: {final_path}")
     
     # Cleanup
     if args.distributed:
