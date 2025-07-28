@@ -127,7 +127,11 @@ def debug_training_step(model, batch, vae_optimizer, dit_optimizer, scaler, step
     
     # Extract video data
     if 'video' in batch:
-        video = batch['video'].to(device, memory_format=torch.channels_last)
+        video = batch['video'].to(device)
+        if video.dim() == 4:  # Image data
+            video = video.to(memory_format=torch.channels_last)
+        elif video.dim() == 5:  # Video data  
+            video = video.to(memory_format=torch.channels_last_3d)
     elif 'target_frames' in batch:
         video = batch['target_frames'].to(device, memory_format=torch.channels_last)
     else:
