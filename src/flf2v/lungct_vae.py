@@ -36,7 +36,7 @@ class LungCTVAE(nn.Module):
         self.latent_channels   = latent_channels
         self.temporal_weight   = temporal_weight
         self.use_tanh_scaling  = use_tanh_scaling
-        self.compression_factor= 8                # 8× in H and W (no temporal downsampling)
+        self.compression_factor= 4                # 8× in H and W (no temporal downsampling)
         self._vae_frozen = False
         # ───────────────────────────────── MedVAE backbone (2-D) ────────────
         self.base_vae = create_model(base_model_name, training=True, state_dict=True)
@@ -110,7 +110,7 @@ class LungCTVAE(nn.Module):
         mu = mu.view(B, T, 1, h, w).permute(0,2,1,3,4)
         logvar = logvar.view(B, T, 1, h, w).permute(0,2,1,3,4)
         
-        return {"latent": z, "mu": mu, "logvar": logvar}
+        return {"latent": z, "mu": mu, "logvar": logvar, "z1": z}
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         B, C, T, h, w = z.shape
@@ -118,10 +118,10 @@ class LungCTVAE(nn.Module):
             z = torch.atanh(torch.clamp(z, -0.999, 0.999))
             z = (z - self.latent_shift) / self.latent_scale
 
+        z2d = z.permute(0,2,1,3,4).reshape(B*T, 1, h, w)
         if self.latent_channels != 1:
             z = self.channel_red(z)
 
-        z2d = z.permute(0,2,1,3,4).reshape(B*T, 1, h, w)
         recon2d = self.base_vae.decode(z2d)                      # (B·T,1,H,W)
         H, W = recon2d.shape[-2:]
         recon = recon2d.view(B, T, 1, H, W).permute(0,2,1,3,4)   # (B,1,T,H,W)
