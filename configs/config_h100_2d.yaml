@@ -22,7 +22,7 @@ model:
     mlp_ratio: 4.0
     dropout: 0.05
     use_rope: true
-    gradient_checkpointing: true
+    gradient_checkpointing: false
 
   # ───────── Flow-matching objective ─────────────────────────────────
   flow_matching_config:

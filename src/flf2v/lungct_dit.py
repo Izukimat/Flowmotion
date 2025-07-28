@@ -169,45 +169,47 @@ class AdaLNZero(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
-        self.eps = eps
         
-        # LayerNorm parameters
-        self.gamma = nn.Parameter(torch.ones(dim))
-        self.beta = nn.Parameter(torch.zeros(dim))
+        # Use nn.LayerNorm instead of manual parameters
+        self.norm = nn.LayerNorm(dim, eps=eps)
         
-        # Modulation network - outputs 6 params per block
+        # Modulation network
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(dim, 6 * dim, bias=True)
         )
         
-        # Initialize to zero for residual behavior
+        # Initialize to zero
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
     
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         More torch.compile friendly version
         """
         # Use standard layer norm
-        x_norm = F.layer_norm(x, (self.dim,), self.gamma, self.beta, self.eps)
+        x_norm = self.norm(x)
         
-        # Get modulation parameters using indexing instead of chunk
+        # Get modulation parameters
         mod_params = self.adaLN_modulation(c)  # [B, 6*dim]
         
-        # FIX: Use slicing instead of chunk (more compile-friendly)
-        shift_mha = mod_params[:, 0:self.dim]
-        scale_mha = mod_params[:, self.dim:2*self.dim]  
-        gate_mha = mod_params[:, 2*self.dim:3*self.dim]
-        shift_ffn = mod_params[:, 3*self.dim:4*self.dim]
-        scale_ffn = mod_params[:, 4*self.dim:5*self.dim]
-        gate_ffn = mod_params[:, 5*self.dim:6*self.dim]
+        # Reshape for broadcasting - add explicit dimensions
+        if x.dim() == 3:  # [B, L, D]
+            mod_params = mod_params.unsqueeze(1)  # [B, 1, 6*dim]
         
-        # Apply modulation for attention
-        x_mod = x_norm * (1 + scale_mha.unsqueeze(1)) + shift_mha.unsqueeze(1)
+        # Use fixed indexing (compile-friendly)
+        dim = self.dim
+        shift_mha = mod_params[..., :dim]
+        scale_mha = mod_params[..., dim:2*dim]
+        gate_mha = mod_params[..., 2*dim:3*dim]
+        shift_ffn = mod_params[..., 3*dim:4*dim]
+        scale_ffn = mod_params[..., 4*dim:5*dim]
+        gate_ffn = mod_params[..., 5*dim:6*dim]
         
-        return x_mod, (shift_ffn, scale_ffn, gate_mha, gate_ffn)
-
+        # Apply modulation
+        x_mha = x_norm * (1 + scale_mha) + shift_mha
+        
+        return x_mha, gate_mha, shift_ffn, scale_ffn, gate_ffn
 
 class DiTBlock(nn.Module):
     """

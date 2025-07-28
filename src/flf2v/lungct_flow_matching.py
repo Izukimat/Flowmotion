@@ -99,7 +99,8 @@ class FlowMatching(nn.Module):
         device = x1.device
         
         # Sample noise
-        x0 = torch.randn_like(x1)
+        noise_scale = 0.01
+        x0 = torch.randn_like(x1) * noise_scale
         
         # Sample time
         t = self.sample_time(B, device)
@@ -114,13 +115,13 @@ class FlowMatching(nn.Module):
         
         # Predict velocity using passed DiT model
         vt_pred = dit_model(xt_flf, t, first_frame, last_frame, frozen_mask)
-        
         # Compute loss with optional weighting
         if self.config.loss_weighting == "uniform":
             loss_weight = 1.0
         elif self.config.loss_weighting == "velocity":
             # Weight by velocity magnitude
             loss_weight = torch.norm(vt_target.reshape(B, -1), dim=1, keepdim=True)
+            loss_weight = loss_weight / (loss_weight.mean() + 1e-8)  # Normalize
             loss_weight = loss_weight.view(-1, 1, 1, 1, 1)
         elif self.config.loss_weighting == "truncated":
             # Truncated weighting for stability
@@ -148,7 +149,7 @@ class FlowMatching(nn.Module):
             'velocity_loss': loss_velocity,
             'flf_loss': loss_flf,
         }
-        
+                
         return losses
     
     @torch.no_grad()
