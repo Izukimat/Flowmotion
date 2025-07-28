@@ -261,11 +261,18 @@ class DiTBlock(nn.Module):
             c: Conditioning (timestep + any other) [B, C]
             mask: Attention mask [B, N, N]
         """
-        B, N, C = x.shape
+        if len(x.shape) == 3:
+            B, N, C = x.shape
+        elif len(x.shape) == 4:
+            B, S, N, C = x.shape
+            x = x.view(B, S * N, C)  # Flatten to [B, N, C]
+            N = S * N
+        else:
+            raise ValueError(f"Unexpected tensor shape: {x.shape}. Expected [B, N, C] or [B, S, N, C]")
         
+            
         # Pre-norm and modulation
-        x_norm, gates = self.norm1(x, c)
-        shift_ffn, scale_ffn, gate_attn, gate_ffn = gates
+        x_norm, gate_attn, shift_ffn, scale_ffn, gate_ffn = self.norm1(x, c)
         
         # local window attention
         x_attn = self.attn(x_norm, spatial_shape)   # [B, N, C]
