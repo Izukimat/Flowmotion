@@ -15,10 +15,10 @@ model:
   # ───────── DiT (backbone) ───────────────────────────────────────────
   dit_config:
     latent_channels: 8
-    latent_size: [82, 32, 32]        # 40 frames, 128×128 → 16×16 after 8× down-sampling
-    hidden_dim: 512
-    depth: 20                        # ~1.1 B parameters – H100 can handle it
-    num_heads: 8
+    latent_size: [41, 32, 32]        # 40 frames, 128×128 → 16×16 after 8× down-sampling
+    hidden_dim: 256
+    depth: 12                 # ~1.1 B parameters – H100 can handle it
+    num_heads: 6
     mlp_ratio: 4.0
     dropout: 0.05
     use_rope: true
@@ -26,7 +26,7 @@ model:
 
   # ───────── Flow-matching objective ─────────────────────────────────
   flow_matching_config:
-    num_sampling_steps: 50           # slight increase
+    num_sampling_steps: 25           # slight increase
     sigma_min: 1e-5
     use_ode_solver: 'euler'
     time_sampling: 'logit_normal'  # More sophisticated
@@ -49,9 +49,9 @@ training:
   finetune_vae: false
   freeze_vae_after: 0
   # ───────── Schedule ────────────────────────────────────────────────
-  num_epochs: 80
+  num_epochs: 50
   val_freq: 4
-  save_freq: 8
+  save_freq: 5
   scheduler_type: 'cosine'
   warmup_epochs: 3
 
@@ -60,11 +60,11 @@ training:
   gradient_accumulation_steps: 1
   mixed_precision: true             # fp16 + bfloat16 automatically on H100
   gradient_checkpointing: false    # not needed – plenty of VRAM
-  compile_model: true 
-  
+  compile_model: false
+
 data:
   # Input is a *single* axial slice time-series → 2-D VAE
-  num_frames: 82
+  num_frames: 41
   input_frames: 10
   target_size: [512, 512]
   slice_mode: 'three_slices'
@@ -74,10 +74,10 @@ data:
 
   augmentation:
     enable_augmentation: true
-    intensity_scale: 0.05
-    intensity_shift: 0.05
-    noise_std: 0.01
-  phase_range: '0-100'  # Full breathing cycle (no filtering)
+    intensity_scale: 0.03
+    intensity_shift: 0.03
+    noise_std: 0.005
+  phase_range: '0-50'  # Full breathing cycle (no filtering)
 inference:
   guidance_scale: 1.0
   num_sampling_steps: 60

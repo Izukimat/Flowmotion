@@ -148,7 +148,6 @@ class LungCTFLF2V(nn.Module):
         video_latent = enc_full['latent']    # Multi-channel for DiT
         mu = enc_full['mu']                  # For KL loss
         logvar = enc_full['logvar']          # For KL loss  
-        z1 = enc_full['z1']                  # 1-channel for VAE reconstruction
         
         # Encode first/last frames (these are small, minimal memory impact)
         first_latent = self.vae.encode(first_frame)['latent']
