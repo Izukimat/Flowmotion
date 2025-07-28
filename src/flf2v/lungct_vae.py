@@ -124,7 +124,7 @@ class LungCTVAE(nn.Module):
 
         z2d = z.permute(0,2,1,3,4).reshape(B*T, C, h, w)
         if self.latent_channels != 1:
-            z2d = self.channel_red(z)
+            z2d = self.channel_red(z2d)
 
         recon2d = self.base_vae.decode(z2d)                      # (B·T,1,H,W)
         H, W = recon2d.shape[-2:]
