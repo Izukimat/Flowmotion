@@ -16,10 +16,10 @@ model:
   dit_config:
     latent_channels: 4
     latent_size: [41, 128, 128]        # 40 frames, 128×128 → 16×16 after 8× down-sampling
-    hidden_dim: 128
-    depth: 4                 # ~1.1 B parameters – H100 can handle it
-    num_heads: 4
-    mlp_ratio: 2.0
+    hidden_dim: 256
+    depth: 16                 # ~1.1 B parameters – H100 can handle it
+    num_heads: 12
+    mlp_ratio: 24.0
     dropout: 0.1
     use_rope: true
     gradient_checkpointing: false
@@ -46,18 +46,18 @@ training:
   vae_kl_weight: 0.01
   vae_temporal_weight: 0.2
   vae_chunk_size: 8 
-  finetune_vae: false
+  finetune_vae: true
   freeze_vae_after: 5000
   # ───────── Schedule ────────────────────────────────────────────────
-  num_epochs: 30
-  val_freq: 4
+  num_epochs: 50
+  val_freq: 5
   save_freq: 5
   scheduler_type: 'cosine'
   warmup_epochs: 3
 
   # ───────── Batch / precision settings for H100-80 GB ───────────────
-  batch_size: 2                   # per GPU (8×40×128² fits with fp16)
-  gradient_accumulation_steps: 2
+  batch_size: 4                   # per GPU (8×40×128² fits with fp16)
+  gradient_accumulation_steps: 1
   mixed_precision: true             # fp16 + bfloat16 automatically on H100
   gradient_checkpointing: true    # not needed – plenty of VRAM
   compile_model: true
