@@ -185,17 +185,22 @@ def train_epoch(
     """Memory-optimized training epoch with debugging"""
     model.train()
     
-    # Use simple running averages instead of storing all losses
-    loss_sum = 0.0
-    velocity_loss_sum = 0.0
-    flf_loss_sum = 0.0
+    # Enhanced loss tracking
+    loss_metrics = {
+        'total': 0.0,
+        'velocity': 0.0,
+        'flf': 0.0,
+        'vae_recon': 0.0,
+        'vae_kl': 0.0,
+        'vae_temporal': 0.0
+    }
     num_batches = 0
     
     # Check if VAE should be frozen
     model_ref = model.module if hasattr(model, 'module') else model
     if model_ref.training_step >= model_ref.freeze_vae_after and not model_ref._vae_frozen:
         model_ref._freeze_vae()
-        logging.info(f"VAE frozen at step {model_ref.training_step}")
+        logging.info(f"🔒 VAE frozen at step {model_ref.training_step}")
     
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
@@ -209,27 +214,49 @@ def train_epoch(
         if step_losses is None:
             continue  # Skip failed batches instead of breaking
         
-        # Update running averages
-        loss_sum += step_losses['loss_total']
-        velocity_loss_sum += step_losses['loss_velocity']
-        flf_loss_sum += step_losses['loss_flf']
+        # Update comprehensive metrics
+        loss_metrics['total'] += step_losses.get('loss_total', 0.0)
+        loss_metrics['velocity'] += step_losses.get('loss_velocity', 0.0)
+        loss_metrics['flf'] += step_losses.get('loss_flf', 0.0)
+        loss_metrics['vae_recon'] += step_losses.get('loss_vae_recon', 0.0)
+        loss_metrics['vae_kl'] += step_losses.get('loss_vae_kl', 0.0)
+        loss_metrics['vae_temporal'] += step_losses.get('loss_vae_temporal', 0.0)
         num_batches += 1
         
         # Update progress bar
         progress_bar.set_postfix({
-            'loss': f"{step_losses['loss_total']:.6f}",
-            'mem_gb': f"{torch.cuda.memory_allocated() / 1e9:.1f}"
+            'loss': f"{step_losses['loss_total']:.4f}",
+            'vel': f"{step_losses.get('loss_velocity', 0):.3f}",
+            'flf': f"{step_losses.get('loss_flf', 0):.3f}",
+            'mem_gb': f"{torch.cuda.memory_allocated() / 1e9:.1f}",
+            'step': model_ref.training_step
         })
+        
+        # Real-time wandb logging (every 20 steps)
+        if use_wandb and model_ref.training_step % 20 == 0:
+            wandb.log({
+                'train/loss_total_realtime': step_losses['loss_total'],
+                'train/loss_velocity_realtime': step_losses.get('loss_velocity', 0),
+                'train/loss_flf_realtime': step_losses.get('loss_flf', 0),
+                'train/lr_vae': vae_optimizer.param_groups[0]['lr'] if vae_optimizer else 0,
+                'train/lr_dit': dit_optimizer.param_groups[0]['lr'] if dit_optimizer else 0,
+                'train/memory_gb': torch.cuda.memory_allocated() / 1e9,
+                'train/step': model_ref.training_step,
+                'train/epoch': epoch
+            })
         
         # Increment training step
         model_ref.training_step += 1
         
-        # Periodic logging (less frequent)
-        if model_ref.training_step % 50 == 0:
-            avg_loss = loss_sum / num_batches if num_batches > 0 else 0
-            logging.info(f"Step {model_ref.training_step} - avg_loss: {avg_loss:.6f}")
+        # Enhanced periodic logging
+        if model_ref.training_step % 100 == 0:
+            current_avg_loss = loss_metrics['total'] / num_batches if num_batches > 0 else 0
+            logging.info(f"📊 Step {model_ref.training_step} | "
+                        f"Avg Loss: {current_avg_loss:.6f} | "
+                        f"Batches: {num_batches} | "
+                        f"Memory: {torch.cuda.memory_allocated() / 1e9:.1f}GB")
         
-        # Memory cleanup (less frequent)
+        # Memory cleanup
         if batch_idx % 100 == 0 and batch_idx > 0:
             torch.cuda.empty_cache()
     
@@ -241,21 +268,36 @@ def train_epoch(
     
     # Compute final averages
     if num_batches > 0:
-        avg_losses = {
-            'loss_total': loss_sum / num_batches,
-            'loss_velocity': velocity_loss_sum / num_batches,
-            'loss_flf': flf_loss_sum / num_batches
-        }
+        avg_losses = {k: v / num_batches for k, v in loss_metrics.items()}
     else:
-        avg_losses = {}
+        avg_losses = {k: 0.0 for k in loss_metrics.keys()}
     
-    # Log to wandb
-    if use_wandb and avg_losses:
-        wandb.log({f'train/{k}': v for k, v in avg_losses.items()}, step=epoch)
+    # Enhanced epoch summary logging
+    logging.info(f"🎯 EPOCH {epoch} TRAINING SUMMARY:")
+    logging.info(f"   📈 Total Loss: {avg_losses['total']:.6f}")
+    logging.info(f"   🎯 Velocity Loss: {avg_losses['velocity']:.6f}")
+    logging.info(f"   🔒 FLF Loss: {avg_losses['flf']:.6f}")
+    logging.info(f"   🖼️  VAE Recon Loss: {avg_losses['vae_recon']:.6f}")
+    logging.info(f"   📊 VAE KL Loss: {avg_losses['vae_kl']:.6f}")
+    logging.info(f"   ⏱️  VAE Temporal Loss: {avg_losses['vae_temporal']:.6f}")
+    logging.info(f"   📚 Processed Batches: {num_batches}")
+    logging.info(f"   🔢 Training Steps: {model_ref.training_step}")
+    
+    # Comprehensive wandb epoch logging
+    if use_wandb:
         wandb.log({
-            'train/lr_vae': vae_optimizer.param_groups[0]['lr'] if vae_optimizer else 0,
-            'train/lr_dit': dit_optimizer.param_groups[0]['lr'] if dit_optimizer else 0,
-        }, step=epoch)
+            'epoch_summary/train_loss_total': avg_losses['total'],
+            'epoch_summary/train_loss_velocity': avg_losses['velocity'],
+            'epoch_summary/train_loss_flf': avg_losses['flf'],
+            'epoch_summary/train_loss_vae_recon': avg_losses['vae_recon'],
+            'epoch_summary/train_loss_vae_kl': avg_losses['vae_kl'],
+            'epoch_summary/train_loss_vae_temporal': avg_losses['vae_temporal'],
+            'epoch_summary/train_batches_processed': num_batches,
+            'epoch_summary/train_steps_total': model_ref.training_step,
+            'epoch_summary/lr_vae': vae_optimizer.param_groups[0]['lr'] if vae_optimizer else 0,
+            'epoch_summary/lr_dit': dit_optimizer.param_groups[0]['lr'] if dit_optimizer else 0,
+            'epoch_summary/epoch': epoch
+        })
     
     return avg_losses
 
@@ -268,16 +310,27 @@ def validate_epoch(
     device,
     use_wandb=False
 ):
-    """Efficient validation"""
+    """Enhanced validation with comprehensive logging"""
     model.eval()
     
-    loss_sum = 0.0
+    # Enhanced validation metrics
+    val_metrics = {
+        'total': 0.0,
+        'velocity': 0.0,
+        'flf': 0.0,
+        'vae_recon': 0.0,
+        'vae_kl': 0.0,
+        'vae_temporal': 0.0
+    }
     num_batches = 0
+    failed_batches = 0
     
     model_ref = model.module if hasattr(model, 'module') else model
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc=f"Val Epoch {epoch}"):
+        progress_bar = tqdm(dataloader, desc=f"Val Epoch {epoch}")
+        
+        for batch_idx, batch in enumerate(progress_bar):
             try:
                 # Move batch data to device
                 if 'target_frames' in batch:
@@ -287,65 +340,101 @@ def validate_epoch(
                 else:
                     continue
                 
-                # 🔧 FIX: Validate and reshape tensor dimensions
-                expected_frames = config['data']['num_frames']
-                batch_size, channels, actual_frames, height, width = video.shape
+                # 🔧 CRITICAL FIX: Use runtime cropping for validation
+                # This ensures consistent sequence length and fixes spatial_shape issues
+                target_frames = config['data'].get('num_frames', 41)
                 
-                # Skip batches with mismatched temporal dimensions
-                if actual_frames != expected_frames:
-                    logging.warning(f"Skipping validation batch: expected {expected_frames} frames, got {actual_frames}")
-                    continue
-                
-                # 🔧 FIX: Additional size validation before VAE encoding
-                # Check if tensor size would cause VAE encoding issues
-                total_elements = video.numel()
-                expected_elements = batch_size * channels * expected_frames * height * width
-                
-                if total_elements != expected_elements:
-                    logging.warning(f"Skipping validation batch: tensor size mismatch. Expected {expected_elements}, got {total_elements}")
-                    continue
-                
-                # 🔧 FIX: Clamp video to ensure reasonable dimensions for VAE
-                if height > 512 or width > 512:
-                    logging.warning(f"Resizing large input from {height}x{width} to 512x512")
-                    video = F.interpolate(
-                        video.view(batch_size * channels, actual_frames, height, width),
-                        size=(512, 512),
-                        mode='bilinear',
-                        align_corners=False
-                    ).view(batch_size, channels, actual_frames, 512, 512)
-                
-                # Forward pass with memory management
+                # Forward pass with runtime cropping (same as training)
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
-                    # 🔧 FIX: Add try-catch around model forward pass to catch shape errors
                     try:
+                        # 🔧 FIX: Use the same runtime cropping as training
+                        all_losses = model_ref(
+                            video, 
+                            target_sequence_length=target_frames,
+                            crop_strategy='center',
+                            return_dict=True
+                        )
+                        total_loss = all_losses.get('loss_total')
+                        
+                        if total_loss is not None and not (torch.isnan(total_loss) or torch.isinf(total_loss)):
+                            val_metrics['total'] += total_loss.item()
+                            val_metrics['velocity'] += all_losses.get('loss_velocity', torch.tensor(0.0)).item()
+                            val_metrics['flf'] += all_losses.get('loss_flf', torch.tensor(0.0)).item()
+                            val_metrics['vae_recon'] += all_losses.get('loss_vae_recon', torch.tensor(0.0)).item()
+                            val_metrics['vae_kl'] += all_losses.get('loss_vae_kl', torch.tensor(0.0)).item()
+                            val_metrics['vae_temporal'] += all_losses.get('loss_vae_temporal', torch.tensor(0.0)).item()
+                            num_batches += 1
+                            
+                            # Update progress bar
+                            progress_bar.set_postfix({
+                                'val_loss': f"{total_loss.item():.4f}",
+                                'success': f"{num_batches}/{batch_idx+1}"
+                            })
+                        else:
+                            failed_batches += 1
+                            
+                    except TypeError:
+                        # Fallback for models without target_sequence_length support
+                        print(f"⚠️  Model doesn't support target_sequence_length, using fallback")
                         all_losses = model_ref(video, return_dict=True)
                         total_loss = all_losses.get('loss_total')
                         
                         if total_loss is not None and not (torch.isnan(total_loss) or torch.isinf(total_loss)):
-                            loss_sum += total_loss.item()
+                            val_metrics['total'] += total_loss.item()
                             num_batches += 1
+                            progress_bar.set_postfix({'val_loss': f"{total_loss.item():.4f}"})
+                        else:
+                            failed_batches += 1
+                            
                     except RuntimeError as e:
-                        if "invalid for input of size" in str(e):
-                            logging.warning(f"Skipping validation batch due to shape error: {e}")
+                        if "invalid for input of size" in str(e) or "shape" in str(e):
+                            failed_batches += 1
+                            if failed_batches <= 5:  # Only log first few failures
+                                logging.warning(f"⚠️  Skipping validation batch {batch_idx}: {e}")
                             continue
                         else:
-                            raise e  # Re-raise if it's not a shape error
+                            raise e
             
             except Exception as e:
-                logging.warning(f"Validation batch failed: {e}")
+                failed_batches += 1
+                if failed_batches <= 5:  # Only log first few failures
+                    logging.warning(f"⚠️  Validation batch {batch_idx} failed: {e}")
                 continue
     
-    # Compute average
-    avg_loss = loss_sum / num_batches if num_batches > 0 else 0
-    avg_losses = {'loss_total': avg_loss} if num_batches > 0 else {}
+    # Compute validation averages
+    if num_batches > 0:
+        avg_val_losses = {k: v / num_batches for k, v in val_metrics.items()}
+    else:
+        avg_val_losses = {k: 0.0 for k in val_metrics.keys()}
     
-    # Log to wandb
-    if use_wandb and avg_losses:
-        wandb.log({f'val/{k}': v for k, v in avg_losses.items()}, step=epoch)
+    # Enhanced validation summary logging
+    logging.info(f"🔍 EPOCH {epoch} VALIDATION SUMMARY:")
+    logging.info(f"   📈 Total Loss: {avg_val_losses['total']:.6f}")
+    logging.info(f"   🎯 Velocity Loss: {avg_val_losses['velocity']:.6f}")
+    logging.info(f"   🔒 FLF Loss: {avg_val_losses['flf']:.6f}")
+    logging.info(f"   🖼️  VAE Recon Loss: {avg_val_losses['vae_recon']:.6f}")
+    logging.info(f"   📊 VAE KL Loss: {avg_val_losses['vae_kl']:.6f}")
+    logging.info(f"   ⏱️  VAE Temporal Loss: {avg_val_losses['vae_temporal']:.6f}")
+    logging.info(f"   ✅ Successful Batches: {num_batches}")
+    logging.info(f"   ❌ Failed Batches: {failed_batches}")
+    logging.info(f"   📊 Success Rate: {num_batches/(num_batches+failed_batches)*100:.1f}%")
     
-    return avg_losses
-
+    # Comprehensive wandb validation logging
+    if use_wandb:
+        wandb.log({
+            'epoch_summary/val_loss_total': avg_val_losses['total'],
+            'epoch_summary/val_loss_velocity': avg_val_losses['velocity'],
+            'epoch_summary/val_loss_flf': avg_val_losses['flf'],
+            'epoch_summary/val_loss_vae_recon': avg_val_losses['vae_recon'],
+            'epoch_summary/val_loss_vae_kl': avg_val_losses['vae_kl'],
+            'epoch_summary/val_loss_vae_temporal': avg_val_losses['vae_temporal'],
+            'epoch_summary/val_batches_successful': num_batches,
+            'epoch_summary/val_batches_failed': failed_batches,
+            'epoch_summary/val_success_rate': num_batches/(num_batches+failed_batches)*100 if (num_batches+failed_batches) > 0 else 0,
+            'epoch_summary/epoch': epoch
+        })
+    
+    return avg_val_losses
 
 def main():
     """Main training function"""
@@ -516,31 +605,88 @@ def main():
         start_epoch = checkpoint['epoch'] + 1
         logging.info(f"Resumed from checkpoint: {args.resume}, epoch {start_epoch}")
     
-    # Training loop
-    val_losses = {}
+    # 🔥 ENHANCED TRAINING LOOP WITH COMPREHENSIVE LOGGING 🔥
+    best_val_loss = float('inf')
+    train_losses_history = []
+    val_losses_history = []
     
     for epoch in range(start_epoch, config['training'].get('num_epochs', 100)):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         
-        # Train
+        # Enhanced epoch start logging
+        logging.info(f"\n🚀 STARTING EPOCH {epoch}")
+        logging.info(f"   📅 Epoch: {epoch}/{config['training'].get('num_epochs', 100)}")
+        logging.info(f"   🎯 Target: 41-frame FLF2V sequences (phase 0→50%)")
+        logging.info(f"   💾 Memory: {torch.cuda.memory_allocated() / 1e9:.1f}GB allocated")
+        
+        # Train with enhanced logging
         train_losses = train_epoch(
             model, train_loader, vae_optimizer, dit_optimizer, 
             vae_scheduler, dit_scheduler,
             scaler, epoch, config, device, not args.no_wandb
         )
         
-        # Validate
+        train_losses_history.append(train_losses)
+        
+        # Validate with enhanced logging
+        val_losses = {}
         if epoch % config['training'].get('val_freq', 5) == 0:
             val_losses = validate_epoch(
                 model, val_loader, epoch, config, device, not args.no_wandb
             )
+            val_losses_history.append(val_losses)
             
-            if val_losses and train_losses:
-                logging.info(f"Epoch {epoch}: Train Loss: {train_losses.get('loss_total', 0):.6f}, "
-                            f"Val Loss: {val_losses.get('loss_total', 0):.6f}")
+            # Enhanced epoch comparison logging
+            if train_losses and val_losses:
+                train_total = train_losses.get('total', 0)
+                val_total = val_losses.get('total', 0)
+                
+                logging.info(f"\n📊 EPOCH {epoch} COMPARISON:")
+                logging.info(f"   🏋️  Training Loss:   {train_total:.6f}")
+                logging.info(f"   🔍 Validation Loss: {val_total:.6f}")
+                logging.info(f"   📈 Difference:      {abs(train_total - val_total):.6f}")
+                
+                if val_total < train_total:
+                    logging.info(f"   ✅ Good generalization (val < train)")
+                elif val_total > train_total * 1.2:
+                    logging.info(f"   ⚠️  Possible overfitting (val >> train)")
+                else:
+                    logging.info(f"   👍 Normal training progress")
+                
+                # Track best model
+                if val_total < best_val_loss:
+                    best_val_loss = val_total
+                    logging.info(f"   🏆 NEW BEST VALIDATION LOSS: {val_total:.6f}")
+                    
+                    # Save best model
+                    if rank == 0:
+                        best_checkpoint = {
+                            'epoch': epoch,
+                            'model_state_dict': model.module.state_dict() if args.distributed else model.state_dict(),
+                            'vae_optimizer_state_dict': vae_optimizer.state_dict(),
+                            'dit_optimizer_state_dict': dit_optimizer.state_dict(),
+                            'scaler_state_dict': scaler.state_dict(),
+                            'config': config,
+                            'train_losses': train_losses,
+                            'val_losses': val_losses,
+                            'best_val_loss': best_val_loss
+                        }
+                        best_path = output_dir / 'best_model.pt'
+                        torch.save(best_checkpoint, best_path)
+                        logging.info(f"   💎 Saved best model: {best_path}")
+                
+                # Comprehensive wandb epoch comparison
+                if not args.no_wandb:
+                    wandb.log({
+                        'epoch_comparison/train_vs_val_diff': abs(train_total - val_total),
+                        'epoch_comparison/train_val_ratio': val_total / train_total if train_total > 0 else 0,
+                        'epoch_comparison/best_val_loss': best_val_loss,
+                        'epoch_comparison/is_best_epoch': val_total == best_val_loss,
+                        'epoch_comparison/epoch': epoch
+                    })
         
-        # Save checkpoint (less frequent)
+        # Save regular checkpoint with enhanced info
         if rank == 0 and epoch % config['training'].get('save_freq', 20) == 0:
             checkpoint = {
                 'epoch': epoch,
@@ -564,17 +710,26 @@ def main():
     
     # Save final model
     if rank == 0:
-        final_path = output_dir / 'final_model.pt'
-        torch.save({
+        final_checkpoint = {
             'model_state_dict': model.module.state_dict() if args.distributed else model.state_dict(),
-            'config': config
-        }, final_path)
+            'config': config,
+            'train_losses_history': train_losses_history,
+            'val_losses_history': val_losses_history,
+            'best_val_loss': best_val_loss,
+            'final_epoch': config['training'].get('num_epochs', 100) - 1
+        }
+        final_path = output_dir / 'final_model.pt'
+        torch.save(final_checkpoint, final_path)
         logging.info(f"💾 Saved final model: {final_path}")
+        
+        # Training summary
+        logging.info(f"\n🎉 TRAINING COMPLETED!")
+        logging.info(f"   🏆 Best validation loss: {best_val_loss:.6f}")
+        logging.info(f"   📈 Total epochs: {config['training'].get('num_epochs', 100)}")
+        logging.info(f"   💾 Models saved in: {output_dir}")
     
     # Cleanup
     if args.distributed:
         dist.destroy_process_group()
 
 
-if __name__ == '__main__':
-    main()
