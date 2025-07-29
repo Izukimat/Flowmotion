@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from torch.compiler import cudagraph_mark_step_begin 
 
 import numpy as np
 import math
@@ -262,11 +263,18 @@ class DiTBlock(nn.Module):
         return x
     
     def forward(self, x, c, spatial_shape):
+        """
+        Run the block with gradient-checkpointing.
+        We clone **after** the checkpoint so the cloned tensor
+        is outside the CUDA graph replay buffer used by torch.compile.
+        """
+        
         if self.training:
-            return checkpoint(self._forward_block, x, c, spatial_shape)
+            x = checkpoint(self._forward_block, x, c, spatial_shape)
         else:
-            return self._forward_block(x, c, spatial_shape)
+            x = self._forward_block(x, c, spatial_shape)
 
+        return x
 
 class LungCTDiT(nn.Module):
     """
@@ -381,6 +389,7 @@ class LungCTDiT(nn.Module):
         Returns:
             Predicted velocity [B, C, D, H, W]
         """
+        cudagraph_mark_step_begin()
         B, C, D, H, W = x_t.shape
     
         

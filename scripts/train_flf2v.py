@@ -63,6 +63,15 @@ def setup_distributed():
     else:
         return 0, 1, 0
 
+def wandb_log_safe(use_wandb, *args, **kwargs):
+    if not use_wandb:
+        return
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            wandb.log(*args, **kwargs)
+    else:
+        wandb.log(*args, **kwargs)
+        
 def create_model(config: Dict, device: str) -> LungCTFLF2V:
     """Create model from config"""
     # Create VAE
@@ -234,7 +243,7 @@ def train_epoch(
         
         # Log to wandb if enabled
         if use_wandb and batch_idx % 10 == 0:
-            wandb.log({
+            wandb_log_safe(use_wandb,{
                 'train/loss_total': step_losses['loss_total'],
                 'train/loss_velocity': step_losses['loss_velocity'],
                 'train/loss_flf': step_losses['loss_flf'],
@@ -285,7 +294,7 @@ def train_epoch(
     
     # Comprehensive wandb epoch logging
     if use_wandb:
-        wandb.log({
+        wandb_log_safe(use_wandb,{
             'epoch_summary/train_loss_total': avg_losses['loss_total'],
             'epoch_summary/train_loss_velocity': avg_losses['loss_velocity'],
             'epoch_summary/train_loss_flf': avg_losses['loss_flf'],
@@ -421,7 +430,7 @@ def validate_epoch(
     
     # Comprehensive wandb validation logging
     if use_wandb:
-        wandb.log({
+        wandb_log_safe(use_wandb,{
             'epoch_summary/val_loss_total': avg_val_losses['loss_total'],
             'epoch_summary/val_loss_velocity': avg_val_losses['loss_velocity'],
             'epoch_summary/val_loss_flf': avg_val_losses['loss_flf'],
@@ -548,6 +557,9 @@ def main():
     
     # Create model
     model = create_model(config, device)
+    
+    for p in model.vae.parameters():
+        p.requires_grad = False
     
     # Skip compilation for memory efficiency during debugging
     if config['training'].get('compile_model', False):
@@ -680,7 +692,7 @@ def main():
                 
                 # Comprehensive wandb epoch comparison
                 if not args.no_wandb:
-                    wandb.log({
+                    wandb_log_safe(use_wandb,{
                         'epoch_comparison/train_vs_val_diff': abs(train_total - val_total),
                         'epoch_comparison/train_val_ratio': val_total / train_total if train_total > 0 else 0,
                         'epoch_comparison/best_val_loss': best_val_loss,
@@ -729,7 +741,10 @@ def main():
         logging.info(f"   🏆 Best validation loss: {best_val_loss:.6f}")
         logging.info(f"   📈 Total epochs: {config['training'].get('num_epochs', 100)}")
         logging.info(f"   💾 Models saved in: {output_dir}")
-    
+
+    if dist.is_initialized():
+        dist.barrier()  # Synchronize all ranks
+
     # Cleanup
     if args.distributed:
         dist.destroy_process_group()
