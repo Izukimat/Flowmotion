@@ -10,23 +10,23 @@ model:
   vae_base_model: 'medvae_4_1_2d'
   latent_channels: 4
   vae_temporal_weight: 0.1
-  freeze_vae_after: 0            # fine-tune a few k steps, then freeze
+  freeze_vae_after: 5000            # fine-tune a few k steps, then freeze
 
   # ───────── DiT (backbone) ───────────────────────────────────────────
   dit_config:
     latent_channels: 4
     latent_size: [41, 128, 128]        # 40 frames, 128×128 → 16×16 after 8× down-sampling
-    hidden_dim: 256
-    depth: 12                 # ~1.1 B parameters – H100 can handle it
-    num_heads: 6
-    mlp_ratio: 4.0
-    dropout: 0.05
+    hidden_dim: 128
+    depth: 4                 # ~1.1 B parameters – H100 can handle it
+    num_heads: 4
+    mlp_ratio: 2.0
+    dropout: 0.1
     use_rope: true
     gradient_checkpointing: false
 
   # ───────── Flow-matching objective ─────────────────────────────────
   flow_matching_config:
-    num_sampling_steps: 25           # slight increase
+    num_sampling_steps: 20           # slight increase
     sigma_min: 1e-5
     use_ode_solver: 'euler'
     time_sampling: 'logit_normal'  # More sophisticated
@@ -35,32 +35,32 @@ model:
 
 training:
   # ───────── Optimisation ╱ regularisation ───────────────────────────
-  vae_lr: 1.0e-4
+  vae_lr: 5.0e-5
   dit_lr: 5.0e-5                    # lower to stabilise the bigger model
   weight_decay: 0.02
   grad_clip: 1.0
 
   velocity_weight: 1.0
   flf_weight: 0.1
-  vae_recon_weight: 1.0
+  vae_recon_weight: 0.5
   vae_kl_weight: 0.01
-  vae_temporal_weight: 0.1
+  vae_temporal_weight: 0.2
   vae_chunk_size: 8 
   finetune_vae: false
-  freeze_vae_after: 0
+  freeze_vae_after: 5000
   # ───────── Schedule ────────────────────────────────────────────────
-  num_epochs: 50
+  num_epochs: 30
   val_freq: 4
   save_freq: 5
   scheduler_type: 'cosine'
   warmup_epochs: 3
 
   # ───────── Batch / precision settings for H100-80 GB ───────────────
-  batch_size: 4                     # per GPU (8×40×128² fits with fp16)
-  gradient_accumulation_steps: 1
+  batch_size: 2                   # per GPU (8×40×128² fits with fp16)
+  gradient_accumulation_steps: 2
   mixed_precision: true             # fp16 + bfloat16 automatically on H100
-  gradient_checkpointing: false    # not needed – plenty of VRAM
-  compile_model: false
+  gradient_checkpointing: true    # not needed – plenty of VRAM
+  compile_model: true
 
 data:
   # Input is a *single* axial slice time-series → 2-D VAE

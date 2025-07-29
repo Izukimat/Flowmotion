@@ -179,10 +179,6 @@ class FlowMatching(nn.Module):
         device = first_frame.device
         D = num_frames
         
-        print(f"🔧 Flow Matching Sampler:")
-        print(f"   Expected frames: {num_frames}")
-        print(f"   Input shapes: first={first_frame.shape}, last={last_frame.shape}")
-        
         # Initialize with noise
         x = torch.randn(B, C, D, H, W, device=device)
         
@@ -203,10 +199,7 @@ class FlowMatching(nn.Module):
         num_steps = self.config.num_sampling_steps
         timesteps = torch.linspace(0, 1, num_steps + 1, device=device)
         dt = 1.0 / num_steps
-        
-        print(f"   Sampling steps: {num_steps}")
-        print(f"   Initial x shape: {x.shape}")
-        
+
         # Sampling loop with debugging
         iterator = tqdm(range(num_steps), desc="Sampling", disable=not progress_bar)
         
@@ -214,21 +207,9 @@ class FlowMatching(nn.Module):
             t = timesteps[i]
             t_batch = torch.full((B,), t.item(), device=device)
             
-            # 🔧 CRITICAL FIX: Log tensor dimensions before DiT call
-            if i == 0:
-                print(f"   Calling DiT with:")
-                print(f"     x: {x.shape}")
-                print(f"     first_frame_full: {first_frame_full.shape}")
-                print(f"     last_frame_full: {last_frame_full.shape}")
-                print(f"     frozen_mask: {frozen_mask.shape}")
-            
             # Predict velocity
             with torch.cuda.amp.autocast(enabled=True):
                 v = dit_model(x, t_batch, first_frame_full, last_frame_full, frozen_mask)
-            
-            # Log velocity shape on first iteration
-            if i == 0:
-                print(f"   DiT returned velocity: {v.shape}")
             
             # Classifier-free guidance if requested
             if guidance_scale is not None and guidance_scale != 1.0:

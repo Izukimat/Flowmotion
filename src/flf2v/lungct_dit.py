@@ -39,18 +39,15 @@ class WindowedSelfAttention(nn.Module):
         # 🔧 CRITICAL FIX: Validate tensor dimensions match spatial_shape
         expected_tokens = T * H * W
         if N != expected_tokens:
-            print(f"⚠️  WindowedSelfAttention: Expected {expected_tokens} tokens (T={T}×H={H}×W={W}), got {N}")
-            print(f"   Adapting spatial_shape to match actual tensor dimensions...")
             
             # Calculate actual dimensions from tensor
             # Assume H and W are correct, solve for T
             actual_T = N // (H * W)
             T = actual_T
             shape = (T, H, W)
-            print(f"   Adapted spatial_shape: {shape}")
 
         # ------------- reshape & pad -----------------
-        x = x.view(B, T, H, W, C)            # -> grid
+        x = x.reshape(B, T, H, W, C)            # -> grid
         pad_t = (wT - T % wT) % wT
         pad_h = (wH - H % wH) % wH
         pad_w = (wW - W % wW) % wW
@@ -62,16 +59,16 @@ class WindowedSelfAttention(nn.Module):
         Tp, Hp, Wp = x.shape[1:4]
 
         # partition windows -> [B * nW, win_size, C]
-        x = x.view(B,
+        x = x.reshape(B,
                    Tp // wT, wT,
                    Hp // wH, wH,
                    Wp // wW, wW, C)
         x = x.permute(0,1,3,5,2,4,6,7).contiguous()
-        x = x.view(-1, wT*wH*wW, C)
+        x = x.reshape(-1, wT*wH*wW, C)
 
         # ------------- attention ---------------------
         qkv = self.qkv(x).chunk(3, dim=-1)
-        q, k, v = [t.view(t.shape[0], t.shape[1], self.num_heads, self.head_dim
+        q, k, v = [t.reshape(t.shape[0], t.shape[1], self.num_heads, self.head_dim
                           ).transpose(1, 2) for t in qkv]  # [B*nW, H, S, Dh]
 
         attn  = (q @ k.transpose(-2, -1)) * self.scale
@@ -81,12 +78,12 @@ class WindowedSelfAttention(nn.Module):
         x_out = self.proj(x_out)
 
         # ------------- reverse windows ---------------
-        x_out = x_out.view(B,
+        x_out = x_out.reshape(B,
                            Tp // wT, Hp // wH, Wp // wW,
                            wT, wH, wW, C)
         x_out = x_out.permute(0,1,4,2,5,3,6,7).contiguous()
-        x_out = x_out.view(B, Tp, Hp, Wp, C)[:, :T, :H, :W]  # drop pad
-        return x_out.view(B, N, C)        # flatten back
+        x_out = x_out.reshape(B, Tp, Hp, Wp, C)[:, :T, :H, :W]  # drop pad
+        return x_out.reshape(B, N, C)        # flatten back
 
 
 # ORIGINAL ARCHITECTURE - Keep exact same structure as trained model
@@ -120,14 +117,12 @@ class PatchMerging3D(nn.Module):
         # 🔧 FIXED: Adaptive dimension validation
         expected_tokens = T * H * W
         if N != expected_tokens:
-            print(f"⚠️  PatchMerging3D: Expected {expected_tokens} tokens, got {N}")
             # Adapt T to match actual tokens
             actual_T = N // (H * W)
             T = actual_T
-            print(f"   Adapted T: {T}")
         
         # Reshape to grid
-        x = x.view(B, T, H, W, C)
+        x = x.reshape(B, T, H, W, C)
         
         # Pad if needed
         pad_t = (dT - T % dT) % dT
@@ -140,12 +135,12 @@ class PatchMerging3D(nn.Module):
         T_pad, H_pad, W_pad = x.shape[1:4]
         
         # Merge patches
-        x = x.view(B,
+        x = x.reshape(B,
                    T_pad // dT, dT,
                    H_pad // dH, dH,
                    W_pad // dW, dW, C)
         x = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous()
-        x = x.view(B, (T_pad // dT) * (H_pad // dH) * (W_pad // dW), dT * dH * dW * C)
+        x = x.reshape(B, (T_pad // dT) * (H_pad // dH) * (W_pad // dW), dT * dH * dW * C)
         
         # Project - Use ORIGINAL layer names
         x = self.reduction(x)
@@ -243,7 +238,7 @@ class DiTBlock(nn.Module):
             B, N, C = x.shape
         elif len(x.shape) == 4:
             B, S, N, C = x.shape
-            x = x.view(B, S * N, C)  # Flatten to [B, N, C]
+            x = x.reshape(B, S * N, C)  # Flatten to [B, N, C]
             N = S * N
         else:
             raise ValueError(f"Unexpected tensor shape: {x.shape}. Expected [B, N, C] or [B, S, N, C]")
@@ -387,9 +382,7 @@ class LungCTDiT(nn.Module):
             Predicted velocity [B, C, D, H, W]
         """
         B, C, D, H, W = x_t.shape
-        
-        print(f"🔧 DiT Forward (Backward Compatible):")
-        print(f"   Input x_t: {x_t.shape}")
+    
         
         # Patchify
         x = self.patchify(x_t)  # [B, hidden_dim, D, H, W]
@@ -401,11 +394,9 @@ class LungCTDiT(nn.Module):
         actual_D = actual_tokens // (actual_H * actual_W)  # Solve for D
         
         initial_spatial_shape = (actual_D, actual_H, actual_W)
-        print(f"   Calculated spatial_shape: {initial_spatial_shape}")
         
         # ---- patch merge ---- (ORIGINAL IMPLEMENTATION)
         x, spatial_shape = self.patch_merge(x, initial_spatial_shape)
-        print(f"   After patch_merge: {x.shape}, spatial_shape: {spatial_shape}")
         
         # Time embedding
         t_emb = self.time_embed(t)
@@ -426,14 +417,10 @@ class LungCTDiT(nn.Module):
         # 🔧 FIXED: Update spatial_shape for conditioning tokens
         T_merged, H_merged, W_merged = spatial_shape
         conditioning_spatial_shape = (T_merged + 2, H_merged, W_merged)
-        
-        print(f"   With conditioning: {x.shape}, spatial_shape: {conditioning_spatial_shape}")
-        
+                
         # Apply transformer blocks - ORIGINAL ARCHITECTURE
         for i, block in enumerate(self.blocks):
             x = block(x, t_emb, spatial_shape=conditioning_spatial_shape)
-            if i == 0:
-                print(f"   After first block: {x.shape}")
         
         # Remove conditioning tokens
         x = x[:, flf_cond.shape[1]:]
@@ -447,13 +434,11 @@ class LungCTDiT(nn.Module):
         
         # 🔧 CRITICAL: Upsample back to original spatial dimensions if needed
         if x.shape[-2:] != (H, W):
-            print(f"   Upsampling from {x.shape[-2:]} to {(H, W)}")
             B_x, C_x, D_x = x.shape[:3]
-            x = x.view(B_x * D_x, C_x, H_merged, W_merged)
+            x = x.reshape(B_x * D_x, C_x, H_merged, W_merged)
             x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
-            x = x.view(B_x, C_x, D_x, H, W)
+            x = x.reshape(B_x, C_x, D_x, H, W)
         
-        print(f"   Final output: {x.shape}")
         return x
 
 

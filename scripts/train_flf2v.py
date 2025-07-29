@@ -31,7 +31,6 @@ from src.flf2v.lungct_vae import LungCTVAE, VAELoss
 from src.flf2v.lungct_dit import create_dit_model
 from src.flf2v.lungct_flow_matching import create_flow_matching_model, FlowMatchingConfig
 
-
 def setup_distributed():
     """Setup distributed training"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -46,25 +45,6 @@ def setup_distributed():
     else:
         return 0, 1, 0
 
-
-def setup_cuda_optimizations():
-    """Setup CUDA-specific optimizations"""
-    # Enable TensorFloat-32 (faster on H100)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    
-    # Optimize memory allocation
-    torch.cuda.empty_cache()
-    
-    # Set memory allocation strategy
-    import os
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:256'
-    
-    # Enable cudnn optimizations
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
-
-
 def create_model(config: Dict, device: str) -> LungCTFLF2V:
     """Create model from config"""
     # Create VAE
@@ -75,10 +55,9 @@ def create_model(config: Dict, device: str) -> LungCTFLF2V:
         use_tanh_scaling=True,
         freeze_pretrained=False
     )
-    
+
     # Create DiT
     dit = create_dit_model(config['model']['dit_config'])
-    
     # Create Flow Matching
     flow_matching = create_flow_matching_model({'config': config['model']['flow_matching_config']})
     
@@ -105,7 +84,7 @@ def create_model(config: Dict, device: str) -> LungCTFLF2V:
 def efficient_training_step(model, batch, vae_optimizer, dit_optimizer, scaler, step, config, device):
     """Memory-efficient training step - minimal debugging"""
     
-    # Extract video data efficiently
+    # Extract video data efficientssly
     if 'target_frames' in batch:
         video = batch['target_frames'].to(device, non_blocking=True)
     elif 'video' in batch:
@@ -158,8 +137,11 @@ def efficient_training_step(model, batch, vae_optimizer, dit_optimizer, scaler, 
         # Return minimal loss info
         return {
             'loss_total': total_loss.item(),
-            'loss_velocity': losses.get('velocity_loss', torch.tensor(0.0)).item(),
-            'loss_flf': losses.get('flf_loss', torch.tensor(0.0)).item()
+            'loss_velocity': losses.get('velocity_loss', torch.tensor(0.0)).item(),      # Fixed key
+            'loss_flf': losses.get('flf_loss', torch.tensor(0.0)).item(),              # Fixed key
+            'loss_vae_recon': losses.get('vae_recon_loss', torch.tensor(0.0)).item(),  # Added
+            'loss_vae_kl': losses.get('vae_kl_loss', torch.tensor(0.0)).item(),        # Added
+            'loss_vae_temporal': losses.get('vae_temporal_loss', torch.tensor(0.0)).item() # Added
         }
         
     except RuntimeError as e:
@@ -228,6 +210,7 @@ def train_epoch(
             'loss': f"{step_losses['loss_total']:.4f}",
             'vel': f"{step_losses.get('loss_velocity', 0):.3f}",
             'flf': f"{step_losses.get('loss_flf', 0):.3f}",
+            'vae': f"{step_losses.get('loss_vae_recon', 0):.3f}",
             'mem_gb': f"{torch.cuda.memory_allocated() / 1e9:.1f}",
             'step': model_ref.training_step
         })
@@ -238,6 +221,7 @@ def train_epoch(
                 'train/loss_total_realtime': step_losses['loss_total'],
                 'train/loss_velocity_realtime': step_losses.get('loss_velocity', 0),
                 'train/loss_flf_realtime': step_losses.get('loss_flf', 0),
+                'train/loss_vae_recon_realtime': step_losses.get('loss_vae_recon', 0),
                 'train/lr_vae': vae_optimizer.param_groups[0]['lr'] if vae_optimizer else 0,
                 'train/lr_dit': dit_optimizer.param_groups[0]['lr'] if dit_optimizer else 0,
                 'train/memory_gb': torch.cuda.memory_allocated() / 1e9,
@@ -251,10 +235,11 @@ def train_epoch(
         # Enhanced periodic logging
         if model_ref.training_step % 100 == 0:
             current_avg_loss = loss_metrics['total'] / num_batches if num_batches > 0 else 0
+            current_avg_vel = loss_metrics['velocity'] / num_batches if num_batches > 0 else 0
             logging.info(f"📊 Step {model_ref.training_step} | "
                         f"Avg Loss: {current_avg_loss:.6f} | "
-                        f"Batches: {num_batches} | "
-                        f"Memory: {torch.cuda.memory_allocated() / 1e9:.1f}GB")
+                        f"Avg Velocity: {current_avg_vel:.6f} | "
+                        f"Batches: {num_batches}")
         
         # Memory cleanup
         if batch_idx % 100 == 0 and batch_idx > 0:
@@ -436,6 +421,7 @@ def validate_epoch(
     
     return avg_val_losses
 
+
 def main():
     """Main training function"""
     # Parse arguments
@@ -454,9 +440,7 @@ def main():
     parser.add_argument('--prefetch-factor', type=int, default=2, help='DataLoader prefetch')
     parser.add_argument('--distributed', action='store_true', help='Use distributed training')
     args = parser.parse_args()
-    
-    # Setup CUDA optimizations
-    setup_cuda_optimizations()
+
     
     # Load config
     with open(args.config, 'r') as f:
@@ -543,6 +527,9 @@ def main():
         collate_fn=lungct_collate_fn,
         persistent_workers=True
     )
+
+    # Call this BEFORE creating your model
+    setup_cuda_memory()
     
     # Create model
     model = create_model(config, device)
@@ -733,3 +720,5 @@ def main():
         dist.destroy_process_group()
 
 
+if __name__ == "__main__":
+    main()

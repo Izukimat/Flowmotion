@@ -141,7 +141,6 @@ class LungCTFLF2V(nn.Module):
         if target_sequence_length is not None:
             original_video = video
             video = self.crop_sequence_runtime(video, target_sequence_length, crop_strategy)
-            print(f"🔧 Runtime cropping: {original_video.shape} → {video.shape}")
         
         batch_size, channels, num_frames, height, width = video.shape
         
@@ -265,7 +264,6 @@ class LungCTFLF2V(nn.Module):
         # 🔧 NEW: Override num_frames if target_sequence_length specified
         if target_sequence_length is not None:
             num_frames = target_sequence_length
-            print(f"🔧 Using target_sequence_length: {num_frames}")
         
         # Ensure correct input dimensions
         if first_frame.dim() == 4:
