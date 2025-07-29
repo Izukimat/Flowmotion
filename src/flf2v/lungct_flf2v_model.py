@@ -139,11 +139,8 @@ class LungCTFLF2V(nn.Module):
         """
         # 🔧 NEW: Runtime sequence cropping
         if target_sequence_length is not None:
-            original_video = video
             video = self.crop_sequence_runtime(video, target_sequence_length, crop_strategy)
-        
-        batch_size, channels, num_frames, height, width = video.shape
-        
+        num_frames = video.shape[2]
         # Extract first and last frames for conditioning
         first_frame = video[:, :, 0:1]  # [B, C, 1, H, W]
         last_frame = video[:, :, -1:]   # [B, C, 1, H, W]
@@ -158,7 +155,7 @@ class LungCTFLF2V(nn.Module):
         first_latent = self.vae.encode(first_frame)['latent']
         last_latent = self.vae.encode(last_frame)['latent']
         
-        # Flow matching loss
+        # Flow matching returns: velocity_loss, flf_loss
         flow_output = self.flow_matching(
             video_latent,
             first_latent,
@@ -167,79 +164,57 @@ class LungCTFLF2V(nn.Module):
             return_dict=True
         )
         
-        # Extract flow losses
-        flow_losses = {
-            f'loss_{k.replace("_loss", "")}': v 
-            for k, v in flow_output.items() 
-            if k.endswith('_loss') and isinstance(v, torch.Tensor)
+        # Flow matching losses - already have correct names
+        losses = {
+            "loss_velocity":  flow_output.get("velocity_loss", torch.tensor(0.0)),
+            "loss_flf":       flow_output.get("flf_loss",      torch.tensor(0.0)),
         }
-        
-        # ✅ VAE LOSSES - reuse components, no second encode
-        vae_losses = {}
+
+            
+        # VAE losses (only if not frozen)
         if self.training_step < self.freeze_vae_after and not self._vae_frozen:
-            
-            # Reconstruction loss (reuse decoded if available)
-            if hasattr(enc_full, 'decoded') and enc_full['decoded'] is not None:
-                decoded = enc_full['decoded']
-            else:
-                decoded = self.vae.decode(video_latent)
-            
-            vae_losses['loss_vae_recon'] = nn.functional.mse_loss(decoded, video)
-            
-            # KL divergence loss (reuse mu, logvar from encode)
-            if mu is not None and logvar is not None:
-                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-                kl_loss = kl_loss / (batch_size * video_latent.numel())
-                vae_losses['loss_vae_kl'] = kl_loss
-            
-            # Temporal consistency loss
-            if num_frames > 1:
-                temporal_diff = video_latent[:, :, 1:] - video_latent[:, :, :-1]
-                vae_losses['loss_vae_temporal'] = torch.mean(temporal_diff.pow(2))
+            video_recon = self.vae.decode(video_latent)
+            losses["loss_vae_recon"]    = F.mse_loss(video_recon, video)
+            losses["loss_vae_kl"]       = (-0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                                        / mu.numel())
+            losses["loss_vae_temporal"] = (F.mse_loss(video_recon[:, :, 1:] - video_recon[:, :, :-1],
+                                                    video[:,        :, 1:] - video[:,        :, :-1])
+                                        if num_frames > 1 else torch.tensor(0.0))
+        else:
+            losses.update({
+                "loss_vae_recon":    torch.tensor(0.0, device=video.device),
+                "loss_vae_kl":       torch.tensor(0.0, device=video.device),
+                "loss_vae_temporal": torch.tensor(0.0, device=video.device),
+            })
+                
+        # Compute weighted total loss
+        loss_total = (
+            self.loss_weights["velocity_weight"] * losses["loss_velocity"]
+            + self.loss_weights["flf_weight"]       * losses["loss_flf"]
+            + self.loss_weights["vae_recon_weight"] * losses["loss_vae_recon"]
+            + self.loss_weights["vae_kl_weight"]    * losses["loss_vae_kl"]
+            + self.loss_weights["vae_temporal_weight"] * losses["loss_vae_temporal"]
+        )
+        losses["loss_total"] = loss_total
         
-        # Combine all losses with weights
-        total_loss = 0
-        all_losses = {**flow_losses, **vae_losses}
-        
-        weighted_losses = {}
-        for loss_name, loss_value in all_losses.items():
-            # Map loss names to weights
-            if 'velocity' in loss_name:
-                weight = self.loss_weights['velocity_weight']
-            elif 'flf' in loss_name:
-                weight = self.loss_weights['flf_weight']
-            elif 'vae_recon' in loss_name:
-                weight = self.loss_weights['vae_recon_weight']
-            elif 'vae_kl' in loss_name:
-                weight = self.loss_weights['vae_kl_weight']
-            elif 'vae_temporal' in loss_name:
-                weight = self.loss_weights['vae_temporal_weight']
-            else:
-                weight = 1.0
-            
-            weighted_loss = weight * loss_value
-            weighted_losses[loss_name] = weighted_loss
-            total_loss += weighted_loss
-        
-        # Add total loss
-        weighted_losses['loss_total'] = total_loss
-        
-        # Increment training step and handle VAE freezing
+        # Update training step
         self.training_step += 1
+        
+        # Check if we should freeze VAE
         if self.training_step >= self.freeze_vae_after and not self._vae_frozen:
             self._freeze_vae()
         
         if return_dict:
-            return weighted_losses
+            return losses
         else:
-            return total_loss
+            return loss_total
     
     @torch.no_grad()
     def generate(
         self,
         first_frame: torch.Tensor,
         last_frame: torch.Tensor,
-        num_frames: int = 82,
+        num_frames: int = 41,
         target_sequence_length: Optional[int] = None,
         guidance_scale: float = 1.0,
         decode: bool = True,
