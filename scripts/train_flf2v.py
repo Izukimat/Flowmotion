@@ -117,11 +117,6 @@ def efficient_training_step(model, batch, vae_opt, dit_opt,
     # ── unpack & move to GPU ─────────────────────────────────────────
     vid = (batch['target_frames'] if 'target_frames' in batch else batch['video']).to(device, non_blocking=True)
     B, C, T, H, W = vid.shape            # shape: [B,C,T,H,W] in pixel space
-    t_rand = torch.rand(B, device=device)  # sample t ∈ [0,1]
-
-    # first / last latent frames (add dummy depth dim so they are 5-D)
-    first = vid[:, :, 0].unsqueeze(2)    # [B,C,1,H,W]
-    last  = vid[:, :, -1].unsqueeze(2)
 
     # ── forward  (autocast for bfloat16) ────────────────────────────
     with torch.autocast('cuda', dtype=torch.bfloat16):
