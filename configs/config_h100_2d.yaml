@@ -41,7 +41,7 @@ training:
   grad_clip: 1.0
 
   velocity_weight: 1.0
-  flf_weight: 0.1
+  flf_weight: 0.25
   vae_recon_weight: 0.5
   vae_kl_weight: 0.01
   vae_temporal_weight: 0.2

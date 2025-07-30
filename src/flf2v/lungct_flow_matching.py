@@ -143,7 +143,7 @@ class FlowMatching(nn.Module):
         loss_velocity = F.mse_loss(vt_pred * loss_weight, vt_target * loss_weight)
         
         # Additional loss to preserve first/last frames
-        loss_flf = F.mse_loss(vt_pred[:, :, [0, -1]], torch.zeros_like(vt_pred[:, :, [0, -1]]))
+        loss_flf = F.mse_loss(vt_pred[:, :, [0, -1]], vt_target[:, :, [0, -1]])
         
         losses = {
             'velocity_loss': loss_velocity,

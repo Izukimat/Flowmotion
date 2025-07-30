@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 
 # Import from package namespace (Fix: proper imports)
 from .lungct_vae import LungCTVAE
@@ -164,10 +165,16 @@ class LungCTFLF2V(nn.Module):
             return_dict=True
         )
         
-        # Flow matching losses - already have correct names
+        device = video.device  # current CUDA device
+
         losses = {
-            "loss_velocity":  flow_output.get("velocity_loss", torch.tensor(0.0)),
-            "loss_flf":       flow_output.get("flf_loss",      torch.tensor(0.0)),
+            # prefer whichever alias FlowMatching really returns
+            "loss_velocity": flow_output.get("loss_velocity",
+                                            flow_output.get("velocity_loss",
+                                                            torch.tensor(0.0, device=device))),
+            "loss_flf":      flow_output.get("loss_flf",
+                                            flow_output.get("flf_loss",
+                                                            torch.tensor(0.0, device=device))),
         }
 
             
