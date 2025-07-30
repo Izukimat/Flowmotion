@@ -1,0 +1,37 @@
+model:
+  vae_base_model: 'medvae_4_1_2d'    # same as training
+  latent_channels: 6
+  vae_temporal_weight: 0.1
+  freeze_vae_after: 0
+
+  dit_config:
+    latent_channels: 6
+    latent_size: [41, 128, 128]
+    hidden_dim: 256
+    depth: 8
+    num_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    use_rope: true
+    gradient_checkpointing: false     # inference: keep off
+
+  flow_matching_config:
+    num_sampling_steps: 20            # can increase up to 40-60 for quality, but 20 is safe
+    sigma_min: 1e-5
+    use_ode_solver: 'euler'
+    time_sampling: 'logit_normal'
+    loss_weighting: 'velocity'
+    interpolation_method: 'optimal_transport'
+
+inference:
+  guidance_scale: 1.0
+  num_sampling_steps: 20              # match model config for now; can tune for quality/speed trade-off
+  batch_size: 1                       # safest for 40GB; raise if fits
+  mixed_precision: true               # if supported, use bf16/amp for speed & VRAM savings
+
+data:
+  num_frames: 41
+  input_frames: 2
+  target_size: [512, 512]
+  intensity_window: [-1000, 500]
+  normalize: true
