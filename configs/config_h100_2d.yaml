@@ -1,16 +1,9 @@
 # config_h100_2d.yaml  –  Optimised for a single NVIDIA H100 80 GB
-#
-# Key changes vs. the V100 config
-# • 2-D MedVAE (8×8 down-sampling) instead of 3-D
-# • Larger DiT backbone (depth 32, hidden 1 024) – fits comfortably in 80 GB
-# • Higher batch size (8 slices × 40 frames) without gradient-checkpointing
-# • Uniform time-sampling keeps things simple; you can switch to logit-normal later
-
 model:
   vae_base_model: 'medvae_4_1_2d'
   latent_channels: 1
   vae_temporal_weight: 0.1
-  freeze_vae_after: 5000            # fine-tune a few k steps, then freeze
+  freeze_vae_after: 0            # fine-tune a few k steps, then freeze
 
   # ───────── DiT (backbone) ───────────────────────────────────────────
   dit_config:
@@ -32,7 +25,9 @@ model:
     time_sampling: 'logit_normal'  # More sophisticated
     loss_weighting: 'velocity'
     interpolation_method: 'optimal_transport'
-
+    num_midpoints: 4
+    mid_loss_weight: 1.0
+    tv_loss_weight: 1e-3
 training:
   # ───────── Optimisation ╱ regularisation ───────────────────────────
   vae_lr: 5.0e-5
@@ -41,13 +36,13 @@ training:
   grad_clip: 1.0
 
   velocity_weight: 1.0
-  flf_weight: 0.25
+  flf_weight: 0.1
   vae_recon_weight: 0.5
   vae_kl_weight: 0.01
   vae_temporal_weight: 0.2
   vae_chunk_size: 8 
-  finetune_vae: true
-  freeze_vae_after: 5000
+  finetune_vae: false
+  freeze_vae_after: 0
   # ───────── Schedule ────────────────────────────────────────────────
   num_epochs: 40
   val_freq: 5
@@ -56,8 +51,8 @@ training:
   warmup_epochs: 3
 
   # ───────── Batch / precision settings for H100-80 GB ───────────────
-  batch_size: 2                   # per GPU (8×40×128² fits with fp16)
-  gradient_accumulation_steps: 2
+  batch_size: 1                   # per GPU (8×40×128² fits with fp16)
+  gradient_accumulation_steps: 4
   mixed_precision: true             # fp16 + bfloat16 automatically on H100
   gradient_checkpointing: true    # not needed – plenty of VRAM
   compile_model: false

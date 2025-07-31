@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 from tqdm import tqdm
 from dataclasses import dataclass
-
+import numpy as np 
 
 @dataclass
 class FlowMatchingConfig:
@@ -24,7 +24,11 @@ class FlowMatchingConfig:
     
     # FLF2V specific
     interpolation_method: str = "optimal_transport"  # "linear", "optimal_transport"
-
+    
+    # mid frame loss
+    num_midpoints: int = 41
+    mid_loss_weight: float = 1.0
+    tv_loss_weight: float = 1e-3
 
 class FlowMatching(nn.Module):
     """
@@ -81,7 +85,8 @@ class FlowMatching(nn.Module):
         first_frame: torch.Tensor,
         last_frame: torch.Tensor,
         dit_model: nn.Module,
-        frozen_mask: Optional[torch.Tensor] = None
+        frozen_mask: Optional[torch.Tensor] = None,
+        z_gt_mid: Optional[torch.Tensor] = None, 
     ) -> Dict[str, torch.Tensor]:
         """
         Compute flow matching loss
@@ -144,10 +149,30 @@ class FlowMatching(nn.Module):
         
         # Additional loss to preserve first/last frames
         loss_flf = F.mse_loss(vt_pred[:, :, [0, -1]], vt_target[:, :, [0, -1]])
-        
+
+        # --------- mid-frame latent supervision -----------
+        loss_mid = torch.tensor(0.0, device=x1.device)
+        if z_gt_mid is not None and self.config.num_midpoints > 0:
+            T = z_gt_mid.shape[2]
+            mid_ids = torch.tensor(
+                np.linspace(1, T - 2, num=min(self.config.num_midpoints, max(T-2,1)), dtype=int),
+                device=x1.device
+            )
+            loss_sum = 0.0
+            for idx in mid_ids:
+                pred_mid = xt_flf[:, :, idx]
+                gt_mid = z_gt_mid[:, :, idx]
+                loss_sum = loss_sum + F.mse_loss(pred_mid, gt_mid)
+            loss_mid = loss_sum / len(mid_ids)
+
+        # --------- temporal smoothness loss ---------------
+        loss_tv = torch.mean((xt_flf[:, :, 1:] - xt_flf[:, :, :-1]) ** 2)
+
         losses = {
             'velocity_loss': loss_velocity,
             'flf_loss': loss_flf,
+            'mid_loss': loss_mid * self.config.mid_loss_weight,
+            'tv_loss':  loss_tv  * self.config.tv_loss_weight,
         }
                 
         return losses
@@ -252,27 +277,27 @@ class FlowMatching(nn.Module):
         last_frame: torch.Tensor,
         dit_model: nn.Module, 
         return_dict: bool = True,
-        frozen_mask: Optional[torch.Tensor] = None
+        frozen_mask: Optional[torch.Tensor] = None,
+        z_gt_mid: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Forward pass computes loss during training"""
-        return self.compute_loss(x1, first_frame, last_frame, dit_model, frozen_mask)
+        return self.compute_loss(x1, first_frame, last_frame, dit_model, frozen_mask, z_gt_mid=z_gt_mid)
 
 def create_flow_matching_model(config: Optional[Dict] = None) -> FlowMatching:
     """
     Factory function to create flow matching model
     """
     if config and 'config' in config:
-        # Fix: Convert string values to proper types
         config_dict = config['config'].copy()
-        if 'sigma_min' in config_dict:
-            config_dict['sigma_min'] = float(config_dict['sigma_min'])
+        # Robust type casting:
+        for k in ['sigma_min', 'guidance_scale', 'mid_loss_weight', 'tv_loss_weight']:
+            if k in config_dict:
+                config_dict[k] = float(config_dict[k])
         if 'num_sampling_steps' in config_dict:
             config_dict['num_sampling_steps'] = int(config_dict['num_sampling_steps'])
-        if 'guidance_scale' in config_dict:
-            config_dict['guidance_scale'] = float(config_dict['guidance_scale'])
-        
+        if 'num_midpoints' in config_dict:
+            config_dict['num_midpoints'] = int(config_dict['num_midpoints'])
         fm_config = FlowMatchingConfig(**config_dict)
     else:
         fm_config = FlowMatchingConfig(**(config or {}))
-    
     return FlowMatching(fm_config)

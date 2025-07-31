@@ -162,20 +162,19 @@ class LungCTFLF2V(nn.Module):
             first_latent,
             last_latent,
             dit_model=self.dit,
-            return_dict=True
+            return_dict=True,
+            z_gt_mid=video_latent
         )
         
         device = video.device  # current CUDA device
 
         losses = {
-            # prefer whichever alias FlowMatching really returns
-            "loss_velocity": flow_output.get("loss_velocity",
-                                            flow_output.get("velocity_loss",
-                                                            torch.tensor(0.0, device=device))),
-            "loss_flf":      flow_output.get("loss_flf",
-                                            flow_output.get("flf_loss",
-                                                            torch.tensor(0.0, device=device))),
+            "loss_velocity": flow_output.get("loss_velocity", flow_output.get("velocity_loss", torch.tensor(0.0, device=device))),
+            "loss_flf":      flow_output.get("loss_flf", flow_output.get("flf_loss", torch.tensor(0.0, device=device))),
+            "loss_mid":      flow_output.get("loss_mid", torch.tensor(0.0, device=device)),
+            "loss_tv":       flow_output.get("loss_tv", torch.tensor(0.0, device=device)),
         }
+
 
             
         # VAE losses (only if not frozen)
@@ -197,7 +196,9 @@ class LungCTFLF2V(nn.Module):
         # Compute weighted total loss
         loss_total = (
             self.loss_weights["velocity_weight"] * losses["loss_velocity"]
-            + self.loss_weights["flf_weight"]       * losses["loss_flf"]
+            + self.loss_weights["flf_weight"]    * losses["loss_flf"]
+            + self.loss_weights.get("mid_loss_weight", 1.0) * losses.get("loss_mid", torch.tensor(0.0, device=device))
+            + self.loss_weights.get("tv_loss_weight", 1e-3) * losses.get("loss_tv", torch.tensor(0.0, device=device))
             + self.loss_weights["vae_recon_weight"] * losses["loss_vae_recon"]
             + self.loss_weights["vae_kl_weight"]    * losses["loss_vae_kl"]
             + self.loss_weights["vae_temporal_weight"] * losses["loss_vae_temporal"]

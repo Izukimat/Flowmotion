@@ -1,11 +1,11 @@
 model:
   vae_base_model: 'medvae_4_1_2d'    # same as training
-  latent_channels: 6
+  latent_channels: 1
   vae_temporal_weight: 0.1
   freeze_vae_after: 0
 
   dit_config:
-    latent_channels: 6
+    latent_channels: 1
     latent_size: [41, 128, 128]
     hidden_dim: 256
     depth: 8
