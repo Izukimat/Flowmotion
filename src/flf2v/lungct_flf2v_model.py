@@ -141,6 +141,7 @@ class LungCTFLF2V(nn.Module):
         # 🔧 NEW: Runtime sequence cropping
         if target_sequence_length is not None:
             video = self.crop_sequence_runtime(video, target_sequence_length, crop_strategy)
+        
         num_frames = video.shape[2]
         # Extract first and last frames for conditioning
         first_frame = video[:, :, 0:1]  # [B, C, 1, H, W]
@@ -169,8 +170,8 @@ class LungCTFLF2V(nn.Module):
         device = video.device  # current CUDA device
 
         losses = {
-            "loss_velocity": flow_output.get("loss_velocity", flow_output.get("velocity_loss", torch.tensor(0.0, device=device))),
-            "loss_flf":      flow_output.get("loss_flf", flow_output.get("flf_loss", torch.tensor(0.0, device=device))),
+            "loss_velocity": flow_output.get("loss_velocity", torch.tensor(0.0, device=device)),
+            "loss_flf":      flow_output.get("loss_flf", torch.tensor(0.0, device=device)),
             "loss_mid":      flow_output.get("loss_mid", torch.tensor(0.0, device=device)),
             "loss_tv":       flow_output.get("loss_tv", torch.tensor(0.0, device=device)),
         }
@@ -255,14 +256,11 @@ class LungCTFLF2V(nn.Module):
             last_frame = last_frame.unsqueeze(2)
         
         print(f"🎬 Generating {num_frames} frames")
-        print(f"   Input shapes: first={first_frame.shape}, last={last_frame.shape}")
         
         # Encode frames to latent space
         first_latent = self.vae.encode(first_frame)['latent']
         last_latent = self.vae.encode(last_frame)['latent']
-        
-        print(f"   Latent shapes: first={first_latent.shape}, last={last_latent.shape}")
-        
+                
         # Generate latent sequence
         latent_video = self.flow_matching.sample(
             first_frame=first_latent,
@@ -272,13 +270,10 @@ class LungCTFLF2V(nn.Module):
             guidance_scale=guidance_scale,
             progress_bar=progress_bar
         )
-        
-        print(f"   Generated latent: {latent_video.shape}")
-        
+                
         # Decode to pixel space if requested
         if decode:
             generated_video = self.vae.decode(latent_video)
-            print(f"   Decoded video: {generated_video.shape}")
             return generated_video
         else:
             return latent_video

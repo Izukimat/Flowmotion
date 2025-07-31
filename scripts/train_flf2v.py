@@ -122,7 +122,10 @@ def efficient_training_step(model, batch, vae_opt, dit_opt,
 
     # ── forward  (autocast for bfloat16) ────────────────────────────
     with torch.autocast('cuda', dtype=torch.bfloat16):
-        losses = model(vid, return_dict=True)
+        losses = model(vid, 
+                       target_sequence_length=41,   # <--- Force to 41 here
+                       crop_strategy="center",
+                       return_dict=True)
 
 
     total = losses['loss_total']
@@ -272,6 +275,8 @@ def train_epoch(
     logging.info(f"   📈 Total Loss: {avg_losses['loss_total']:.6f}")
     logging.info(f"   🎯 Velocity Loss: {avg_losses['loss_velocity']:.6f}")
     logging.info(f"   🔒 FLF Loss: {avg_losses['loss_flf']:.6f}")
+    logging.info(f"   🔒 FLF Loss: {avg_losses['loss_flf']:.6f}")
+    logging.info(f"   🔵 Mid Loss: {avg_losses['loss_mid']:.6f}")
     logging.info(f"   🖼️  VAE Recon Loss: {avg_losses['loss_vae_recon']:.6f}")
     logging.info(f"   📊 VAE KL Loss: {avg_losses['loss_vae_kl']:.6f}")
     logging.info(f"   ⏱️  VAE Temporal Loss: {avg_losses['loss_vae_temporal']:.6f}")
@@ -575,7 +580,7 @@ def main():
     dit_params = list(model_ref.dit.parameters()) + list(model_ref.flow_matching.parameters())
     dit_optimizer = optim.AdamW(
         dit_params,
-        lr=config['training'].get('dit_lr', 1e-4),
+        lr=config['training'].get('dit_lr', 1e-5),
         weight_decay=config['training'].get('weight_decay', 0.01)
     )
     
@@ -722,6 +727,7 @@ def main():
             checkpoint_path = output_dir / f'checkpoint_epoch_{epoch}.pt'
             torch.save(checkpoint, checkpoint_path)
             logging.info(f"💾 Saved checkpoint: {checkpoint_path}")
+            
         if dist.is_initialized():
             dist.barrier()
                 

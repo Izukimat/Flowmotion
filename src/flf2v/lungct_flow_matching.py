@@ -167,14 +167,13 @@ class FlowMatching(nn.Module):
 
         # --------- temporal smoothness loss ---------------
         loss_tv = torch.mean((xt_flf[:, :, 1:] - xt_flf[:, :, :-1]) ** 2)
-
         losses = {
-            'velocity_loss': loss_velocity,
-            'flf_loss': loss_flf,
-            'mid_loss': loss_mid * self.config.mid_loss_weight,
-            'tv_loss':  loss_tv  * self.config.tv_loss_weight,
+            'loss_velocity': loss_velocity,
+            'loss_flf': loss_flf,
+            'loss_mid': loss_mid * self.config.mid_loss_weight,
+            'loss_tv':  loss_tv  * self.config.tv_loss_weight,
         }
-                
+
         return losses
     
     @torch.no_grad()
