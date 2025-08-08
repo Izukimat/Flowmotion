@@ -165,8 +165,7 @@ def efficient_training_step(model, batch, vae_opt, dit_opt,
         'loss_total':        total.item(),
         'loss_velocity':     losses.get('loss_velocity', 0.).item(),
         'loss_flf':          losses.get('loss_flf', 0.).item(),
-        'loss_mid':          losses.get('loss_mid', 0.).item(),    # NEW
-        'loss_tv':           losses.get('loss_tv', 0.).item(),     # NEW
+        'loss_step':          losses.get('loss_step', 0.).item(),
         'loss_vae_recon':    losses.get('loss_vae_recon', 0.).item(),
         'loss_vae_kl':       losses.get('loss_vae_kl', 0.).item(),
         'loss_vae_temporal': losses.get('loss_vae_temporal', 0.).item(),

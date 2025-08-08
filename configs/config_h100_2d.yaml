@@ -9,9 +9,9 @@ model:
   dit_config:
     latent_channels: 1
     latent_size: [41, 128, 128]        # 40 frames, 128×128 → 16×16 after 8× down-sampling
-    hidden_dim: 256
-    depth: 8                 # ~1.1 B parameters – H100 can handle it
-    num_heads: 8
+    hidden_dim: 128
+    depth: 6                # ~1.1 B parameters – H100 can handle it
+    num_heads: 6
     mlp_ratio: 4.0
     dropout: 0.1
     use_rope: true
@@ -54,15 +54,15 @@ training:
   warmup_epochs: 3
 
   # ───────── Batch / precision settings for H100-80 GB ───────────────
-  batch_size: 4                   # per GPU (8×40×128² fits with fp16)
-  gradient_accumulation_steps: 2
+  batch_size: 1                   # per GPU (8×40×128² fits with fp16)
+  gradient_accumulation_steps: 8
   mixed_precision: true             # fp16 + bfloat16 automatically on H100
   gradient_checkpointing: true    # not needed – plenty of VRAM
   compile_model: false
 
 data:
   # Input is a *single* axial slice time-series → 2-D VAE
-  num_frames: 41
+  num_frames: 21
   input_frames: 10
   target_size: [512, 512]
   slice_mode: 'three_slices'
