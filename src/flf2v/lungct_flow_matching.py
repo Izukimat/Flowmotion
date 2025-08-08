@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 from tqdm import tqdm
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
 import numpy as np 
 
 @dataclass
@@ -301,13 +301,17 @@ def create_flow_matching_model(config: Optional[Dict] = None) -> FlowMatching:
     Factory function to create flow matching model
     """
     if config and 'config' in config:
-        config_dict = config['config'].copy()
-        # Robust type casting:
-        for k in ['sigma_min', 'guidance_scale']:
+        raw = config['config'].copy()
+        # Filter unknown keys to avoid TypeError when configs contain deprecated fields
+        allowed = {f.name for f in dataclass_fields(FlowMatchingConfig)}
+        config_dict = {k: v for k, v in raw.items() if k in allowed}
+        # Robust type casting for known numeric fields
+        for k in ['sigma_min', 'guidance_scale', 'step_loss_weight']:
             if k in config_dict:
                 config_dict[k] = float(config_dict[k])
-        if 'num_sampling_steps' in config_dict:
-            config_dict['num_sampling_steps'] = int(config_dict['num_sampling_steps'])
+        for k in ['num_sampling_steps', 'num_step_samples']:
+            if k in config_dict:
+                config_dict[k] = int(config_dict[k])
         fm_config = FlowMatchingConfig(**config_dict)
     else:
         fm_config = FlowMatchingConfig(**(config or {}))
