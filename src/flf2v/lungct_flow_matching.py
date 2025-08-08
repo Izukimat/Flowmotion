@@ -151,7 +151,7 @@ class FlowMatching(nn.Module):
 
         # --------- teacher-forced one-step consistency ---------------
         loss_step = torch.tensor(0.0, device=x1.device)
-        if z_gt_mid is not None and getattr(self.config, 'num_step_samples', 0) > 0:
+        if (self.training if hasattr(self, 'training') else True) and z_gt_mid is not None and getattr(self.config, 'num_step_samples', 0) > 0:
             T = z_gt_mid.shape[2]
             if T > 1:
                 # Sample up to num_step_samples indices in [0, T-2]

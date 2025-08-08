@@ -197,11 +197,13 @@ class DiTBlock(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        gradient_checkpointing: bool = True,
     ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.use_checkpoint = gradient_checkpointing
         
         # Self-attention
         self.attn = WindowedSelfAttention(
@@ -269,7 +271,7 @@ class DiTBlock(nn.Module):
         is outside the CUDA graph replay buffer used by torch.compile.
         """
         
-        if self.training:
+        if self.training and self.use_checkpoint:
             x = checkpoint(self._forward_block, x, c, spatial_shape)
         else:
             x = self._forward_block(x, c, spatial_shape)
@@ -329,6 +331,7 @@ class LungCTDiT(nn.Module):
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
+                gradient_checkpointing=gradient_checkpointing,
             )
             for _ in range(depth)
         ])

@@ -570,7 +570,12 @@ def main():
         model.dit = torch.compile(model.dit, mode='max-autotune', fullgraph=False)
     
     if args.distributed:
+        # Enable static graph to avoid DDP re-entrant checkpointing issues
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        try:
+            model._set_static_graph()
+        except Exception:
+            pass
     
     # Create optimizers
     model_ref = model.module if args.distributed else model

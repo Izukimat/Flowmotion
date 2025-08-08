@@ -10,8 +10,8 @@ DATA_DIR="/home/ubuntu/azureblob/4D-Lung-Interpolated/data"
 METADATA_CSV="/home/ubuntu/flowmotion/splits/metadata.csv"
 
 STAMP=$(date +%Y%m%d_%H%M%S)
-#OUTPUT_DIR="$HOME/azureblob/output/flf2v_8xa100_$STAMP"
-OUTPUT_DIR="$HOME/azureblob/output/flf2v_8xa100_20250731_145847/"
+OUTPUT_DIR="$HOME/azureblob/output/flf2v_8xa100_$STAMP"
+#OUTPUT_DIR="$HOME/azureblob/output/flf2v_8xa100_20250731_145847/"
 mkdir -p "$OUTPUT_DIR"
 cp configs/config_a100.yaml "$OUTPUT_DIR/"
 
