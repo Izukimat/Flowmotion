@@ -47,9 +47,9 @@ class LungCTDataset(Dataset):
         self.df = pd.read_csv(csv_file)
         self.df = self.df[self.df['split'] == split]
         
-        # Apply filters if specified
+        # Apply filters if specified (prefer exact 0-50% range when requested)
         if phase_filter:
-            self.df = self.df[self.df['phase_range'] == phase_filter]
+            self.df = self.df[self.df['phase_range'].astype(str).str.contains(str(phase_filter))]
         
         if experiment_filter:
             self.df = self.df[self.df['experiment_id'].isin(experiment_filter)]
@@ -58,7 +58,7 @@ class LungCTDataset(Dataset):
         
         # Build sample list with verified paths
         self.samples = self.df.to_dict(orient="records")
-        logging.info(f"Loaded manifest with {len(self.samples)} {split} samples")
+        logging.info(f"Loaded manifest with {len(self.samples)} {split} samples (phase_filter={phase_filter})")
     
     def _load_numpy_files(self, sample: Dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Load NumPy arrays for a sample"""

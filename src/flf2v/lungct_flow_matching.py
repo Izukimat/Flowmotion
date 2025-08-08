@@ -17,6 +17,7 @@ class FlowMatchingConfig:
     sigma_min: float = 1e-5
     use_ode_solver: str = "euler"  # "euler", "heun", "dpm"
     guidance_scale: float = 1.0
+    init_strategy: str = "linear"   # "noise" or "linear" initialization at inference
     
     # Training specific
     time_sampling: str = "uniform"  # "uniform", "logit_normal"
@@ -29,6 +30,9 @@ class FlowMatchingConfig:
     num_midpoints: int = 41
     mid_loss_weight: float = 1.0
     tv_loss_weight: float = 1e-3
+    # Teacher-forced one-step prediction
+    step_loss_weight: float = 1.0
+    num_step_samples: int = 4
 
 class FlowMatching(nn.Module):
     """
@@ -167,11 +171,36 @@ class FlowMatching(nn.Module):
 
         # --------- temporal smoothness loss ---------------
         loss_tv = torch.mean((xt_flf[:, :, 1:] - xt_flf[:, :, :-1]) ** 2)
+        # --------- teacher-forced one-step consistency ---------------
+        loss_step = torch.tensor(0.0, device=x1.device)
+        if z_gt_mid is not None and getattr(self.config, 'num_step_samples', 0) > 0:
+            T = z_gt_mid.shape[2]
+            if T > 1:
+                # Sample up to num_step_samples indices in [0, T-2]
+                num_samples = min(self.config.num_step_samples, max(T - 1, 1))
+                idxs = torch.linspace(0, T - 2, steps=num_samples, device=x1.device).round().long()
+                step_losses = []
+                for j in idxs:
+                    # Use ground-truth latent at step j as teacher
+                    xt_teacher = z_gt_mid.clone()
+                    # Predict velocity field at time t_j
+                    t_j = torch.full((B,), float(j.item()) / float(T - 1), device=device)
+                    v_all = dit_model(xt_teacher, t_j, first_frame, last_frame, frozen_mask)
+                    # Single-step Euler update for slice j
+                    dt = 1.0 / float(T - 1)
+                    xj_pred_next = z_gt_mid[:, :, j] + dt * v_all[:, :, j]
+                    # Target is next ground-truth latent
+                    target_next = z_gt_mid[:, :, j + 1]
+                    step_losses.append(F.mse_loss(xj_pred_next, target_next))
+                if step_losses:
+                    loss_step = torch.stack(step_losses).mean()
+
         losses = {
             'loss_velocity': loss_velocity,
             'loss_flf': loss_flf,
             'loss_mid': loss_mid * self.config.mid_loss_weight,
             'loss_tv':  loss_tv  * self.config.tv_loss_weight,
+            'loss_step': loss_step * self.config.step_loss_weight,
         }
 
         return losses
@@ -203,12 +232,21 @@ class FlowMatching(nn.Module):
         device = first_frame.device
         D = num_frames
         
-        # Initialize with noise
-        x = torch.randn(B, C, D, H, W, device=device)
-        
-        # Set first and last frames
-        x[:, :, 0] = first_frame.squeeze(2)
-        x[:, :, -1] = last_frame.squeeze(2)
+        # Initialize trajectory
+        if getattr(self.config, 'init_strategy', 'linear') == 'linear':
+            # Linear interpolation between endpoints as a strong prior
+            first = first_frame.squeeze(2)  # [B,C,H,W]
+            last  = last_frame.squeeze(2)
+            x = torch.zeros(B, C, D, H, W, device=device)
+            for i in range(D):
+                r = i / max(D - 1, 1)
+                x[:, :, i] = (1.0 - r) * first + r * last
+        else:
+            # Random Gaussian init
+            x = torch.randn(B, C, D, H, W, device=device)
+            # Set endpoints explicitly
+            x[:, :, 0] = first_frame.squeeze(2)
+            x[:, :, -1] = last_frame.squeeze(2)
         
         # Create frozen mask
         frozen_mask = torch.zeros(B, D, device=device)
@@ -262,7 +300,7 @@ class FlowMatching(nn.Module):
                 else:
                     x = x + dt * v
             
-            # Enforce first/last frame constraints
+            # Enforce first/last frame constraints at every step
             x[:, :, 0] = first_frame.squeeze(2)
             x[:, :, -1] = last_frame.squeeze(2)
         

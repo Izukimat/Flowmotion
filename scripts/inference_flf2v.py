@@ -26,11 +26,11 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import zoom
 import yaml
 
-# Import our modules
-from lungct_vae import LungCTVAE
-from lungct_dit import create_dit_model
-from lungct_flow_matching import create_flow_matching_model, FlowMatchingConfig
-from lungct_flf2v_model import LungCTFLF2V
+# Import our modules (absolute package path)
+from src.flf2v.lungct_vae import LungCTVAE
+from src.flf2v.lungct_dit import create_dit_model
+from src.flf2v.lungct_flow_matching import create_flow_matching_model, FlowMatchingConfig
+from src.flf2v.lungct_flf2v_model import LungCTFLF2V
 
 
 # ============= Inference Dataset =============
@@ -121,7 +121,7 @@ def load_model(checkpoint_path: str, device: str = 'cuda') -> Tuple[LungCTFLF2V,
     dit = create_dit_model(config['model']['dit_config'])
     
     fm_config = FlowMatchingConfig(**config['model']['flow_matching_config'])
-    flow_matching = create_flow_matching_model(dit, {'config': fm_config})
+    flow_matching = create_flow_matching_model({'config': config['model']['flow_matching_config']})
     
     model = LungCTFLF2V(
         vae=vae,
@@ -475,8 +475,8 @@ def main():
     dataset = InferenceDataset(
         first_frames,
         last_frames,
-        target_size=tuple(config['data']['target_size'][:2]),
-        intensity_window=tuple(config['data'].get('intensity_window', (-1000, 500)))
+        target_size=tuple(config['data']['target_size'][:2]) if 'target_size' in config['data'] else (128, 128),
+        intensity_window=tuple(config['data'].get('intensity_window', (-600, 900)))
     )
     
     dataloader = DataLoader(

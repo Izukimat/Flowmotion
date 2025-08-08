@@ -92,8 +92,9 @@ def create_model(config: Dict, device: str) -> LungCTFLF2V:
     loss_weights = {
         'velocity_weight': config['training'].get('velocity_weight', 1.0),
         'flf_weight': config['training'].get('flf_weight', 0.1),
-        'mid_loss_weight': config['training'].get('mid_loss_weight', 1.0),     # NEW
-        'tv_loss_weight': config['training'].get('tv_loss_weight', 1e-3),      # NEW
+        'mid_loss_weight': config['training'].get('mid_loss_weight', 0.0),     # default 0
+        'tv_loss_weight': config['training'].get('tv_loss_weight', 0.0),       # default 0
+        'step_loss_weight': config['training'].get('step_loss_weight', 1.0),   # teacher-forced step
         'vae_recon_weight': config['training'].get('vae_recon_weight', 1.0),
         'vae_kl_weight': config['training'].get('vae_kl_weight', 0.01),
         'vae_temporal_weight': config['training'].get('vae_temporal_weight', 0.1)
@@ -122,10 +123,14 @@ def efficient_training_step(model, batch, vae_opt, dit_opt,
 
     # ── forward  (autocast for bfloat16) ────────────────────────────
     with torch.autocast('cuda', dtype=torch.bfloat16):
-        losses = model(vid, 
-                       target_sequence_length=41,   # <--- Force to 41 here
-                       crop_strategy="center",
-                       return_dict=True)
+        # Use config-driven target length and clinically-meaningful cropping (0%→50%)
+        target_len = cfg['data'].get('num_frames', 41)
+        losses = model(
+            vid,
+            target_sequence_length=target_len,
+            crop_strategy='phase_0_to_5',
+            return_dict=True
+        )
 
 
     total = losses['loss_total']
@@ -502,14 +507,15 @@ def main():
             config=config
         )
     
-    # Create datasets
+    # Create datasets (filter to 0-50% phase range if specified)
     train_dataset = LungCTDataset(
         csv_file=args.csv_file,
         split='train',
         data_root=args.data_root,
         augment=config['data'].get('augmentation', {}).get('enable_augmentation', True),
         normalize=True,
-        load_target_frames=True
+        load_target_frames=True,
+        phase_filter=config['data'].get('phase_range', None)
     )
     
     val_dataset = LungCTDataset(
@@ -518,7 +524,8 @@ def main():
         data_root=args.data_root,
         augment=False,
         normalize=True,
-        load_target_frames=True
+        load_target_frames=True,
+        phase_filter=config['data'].get('phase_range', None)
     )
     
     logging.info(f"📚 Loaded {len(train_dataset)} train samples")

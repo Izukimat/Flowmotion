@@ -25,9 +25,10 @@ model:
     time_sampling: 'logit_normal'  # More sophisticated
     loss_weighting: 'velocity'
     interpolation_method: 'optimal_transport'
-    num_midpoints: 41
-    mid_loss_weight: 1.0
-    tv_loss_weight: 0.1
+    # The following regularizers as implemented do not backprop through the model; keep at zero
+    num_midpoints: 0
+    mid_loss_weight: 0.0
+    tv_loss_weight: 0.0
 training:
   # ───────── Optimisation ╱ regularisation ───────────────────────────
   vae_lr: 5.0e-5
@@ -43,6 +44,8 @@ training:
   vae_chunk_size: 8 
   finetune_vae: false
   freeze_vae_after: 0
+  # auxiliary loss weights (teacher-forcing)
+  step_loss_weight: 1.0
   # ───────── Schedule ────────────────────────────────────────────────
   num_epochs: 40
   val_freq: 5
@@ -64,7 +67,7 @@ data:
   target_size: [512, 512]
   slice_mode: 'three_slices'
   slice_indices: [12, 25, 37]
-  intensity_window: [-1000, 500]
+  intensity_window: [-600, 900]
   normalize: true  # Apply lung windowing and normalize to [-1, 1]
 
   augmentation:
