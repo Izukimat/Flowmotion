@@ -420,7 +420,9 @@ def validate_epoch(
     logging.info(f"   ⏱️  VAE Temporal Loss: {avg_val_losses['loss_vae_temporal']:.6f}")
     logging.info(f"   ✅ Successful Batches: {num_batches}")
     logging.info(f"   ❌ Failed Batches: {failed_batches}")
-    logging.info(f"   📊 Success Rate: {num_batches/(num_batches+failed_batches)*100:.1f}%")
+    total_batches = num_batches + failed_batches
+    success_rate = (num_batches / total_batches * 100.0) if total_batches > 0 else 0.0
+    logging.info(f"   📊 Success Rate: {success_rate:.1f}%")
     
     # Comprehensive wandb validation logging
     if use_wandb:
