@@ -92,8 +92,6 @@ def create_model(config: Dict, device: str) -> LungCTFLF2V:
     loss_weights = {
         'velocity_weight': config['training'].get('velocity_weight', 1.0),
         'flf_weight': config['training'].get('flf_weight', 0.1),
-        'mid_loss_weight': config['training'].get('mid_loss_weight', 0.0),     # default 0
-        'tv_loss_weight': config['training'].get('tv_loss_weight', 0.0),       # default 0
         'step_loss_weight': config['training'].get('step_loss_weight', 1.0),   # teacher-forced step
         'vae_recon_weight': config['training'].get('vae_recon_weight', 1.0),
         'vae_kl_weight': config['training'].get('vae_kl_weight', 0.01),
@@ -196,8 +194,7 @@ def train_epoch(
         "loss_total":        0.0,
         "loss_velocity":     0.0,
         "loss_flf":          0.0,
-        "loss_mid":          0.0,    # NEW
-        "loss_tv":           0.0,    # NEW
+        "loss_step":         0.0,
         "loss_vae_recon":    0.0,
         "loss_vae_kl":       0.0,
         "loss_vae_temporal": 0.0,
@@ -232,8 +229,7 @@ def train_epoch(
             'total': f"{step_losses['loss_total']:.4f}",
             'vel': f"{step_losses['loss_velocity']:.4f}",
             'flf': f"{step_losses['loss_flf']:.4f}",
-            'mid':   f"{step_losses['loss_mid']:.4f}",    # NEW
-            'tv':    f"{step_losses['loss_tv']:.4f}",     # NEW
+            'step':  f"{step_losses.get('loss_step',0.0):.4f}",
             'vae_r': f"{step_losses['loss_vae_recon']:.4f}",
             'vae_kl': f"{step_losses['loss_vae_kl']:.4f}",
             'vae_t': f"{step_losses['loss_vae_temporal']:.4f}"
@@ -245,8 +241,7 @@ def train_epoch(
                 'train/loss_total': step_losses['loss_total'],
                 'train/loss_velocity': step_losses['loss_velocity'],
                 'train/loss_flf': step_losses['loss_flf'],
-                'train/loss_mid': step_losses['loss_mid'],      # NEW
-                'train/loss_tv': step_losses['loss_tv'],        # NEW
+                'train/loss_step': step_losses.get('loss_step', 0.0),
                 'train/loss_vae_recon': step_losses['loss_vae_recon'],
                 'train/loss_vae_kl': step_losses['loss_vae_kl'],
                 'train/loss_vae_temporal': step_losses['loss_vae_temporal'],
@@ -280,8 +275,7 @@ def train_epoch(
     logging.info(f"   📈 Total Loss: {avg_losses['loss_total']:.6f}")
     logging.info(f"   🎯 Velocity Loss: {avg_losses['loss_velocity']:.6f}")
     logging.info(f"   🔒 FLF Loss: {avg_losses['loss_flf']:.6f}")
-    logging.info(f"   🔒 FLF Loss: {avg_losses['loss_flf']:.6f}")
-    logging.info(f"   🔵 Mid Loss: {avg_losses['loss_mid']:.6f}")
+    logging.info(f"   🟣 Step Loss: {avg_losses.get('loss_step',0.0):.6f}")
     logging.info(f"   🖼️  VAE Recon Loss: {avg_losses['loss_vae_recon']:.6f}")
     logging.info(f"   📊 VAE KL Loss: {avg_losses['loss_vae_kl']:.6f}")
     logging.info(f"   ⏱️  VAE Temporal Loss: {avg_losses['loss_vae_temporal']:.6f}")
@@ -294,8 +288,7 @@ def train_epoch(
             'epoch_summary/train_loss_total': avg_losses['loss_total'],
             'epoch_summary/train_loss_velocity': avg_losses['loss_velocity'],
             'epoch_summary/train_loss_flf': avg_losses['loss_flf'],
-            'epoch_summary/train_loss_mid': avg_losses['loss_mid'],      # NEW
-            'epoch_summary/train_loss_tv': avg_losses['loss_tv'],   
+            'epoch_summary/train_loss_step': avg_losses.get('loss_step', 0.0),
             'epoch_summary/train_loss_vae_recon': avg_losses['loss_vae_recon'],
             'epoch_summary/train_loss_vae_kl': avg_losses['loss_vae_kl'],
             'epoch_summary/train_loss_vae_temporal': avg_losses['loss_vae_temporal'],
@@ -325,8 +318,7 @@ def validate_epoch(
         "loss_total":        0.0,
         "loss_velocity":     0.0,
         "loss_flf":          0.0,
-        "loss_mid":          0.0,    # NEW
-        "loss_tv":           0.0,    # NEW  
+        "loss_step":         0.0,
         "loss_vae_recon":    0.0,
         "loss_vae_kl":       0.0,
         "loss_vae_temporal": 0.0,
@@ -368,9 +360,8 @@ def validate_epoch(
                         if total_loss is not None and not (torch.isnan(total_loss) or torch.isinf(total_loss)):
                             val_metrics['loss_total'] += total_loss.item()
                             val_metrics['loss_velocity'] += all_losses.get('loss_velocity', torch.tensor(0.0)).item()
-                            val_metrics['loss_flf'] += all_losses.get('loss_flf', torch.tensor(0.0)).item()
-                            val_metrics['loss_mid']        += all_losses.get('loss_mid', torch.tensor(0.0)).item()      # NEW
-                            val_metrics['loss_tv']         += all_losses.get('loss_tv', torch.tensor(0.0)).item()  
+                            val_metrics['loss_flf']  += all_losses.get('loss_flf', torch.tensor(0.0)).item()
+                            val_metrics['loss_step']+= all_losses.get('loss_step', torch.tensor(0.0)).item()
                             val_metrics['loss_vae_recon'] += all_losses.get('loss_vae_recon', torch.tensor(0.0)).item()
                             val_metrics['loss_vae_kl'] += all_losses.get('loss_vae_kl', torch.tensor(0.0)).item()
                             val_metrics['loss_vae_temporal'] += all_losses.get('loss_vae_temporal', torch.tensor(0.0)).item()
@@ -423,8 +414,7 @@ def validate_epoch(
     logging.info(f"   📈 Total Loss: {avg_val_losses['loss_total']:.6f}")
     logging.info(f"   🎯 Velocity Loss: {avg_val_losses['loss_velocity']:.6f}")
     logging.info(f"   🔒 FLF Loss: {avg_val_losses['loss_flf']:.6f}")
-    logging.info(f"   🔵 Mid Loss: {avg_val_losses['loss_mid']:.6f}")
-    logging.info(f"   🟢 TV Loss: {avg_val_losses['loss_tv']:.6f}")
+    logging.info(f"   🟣 Step Loss: {avg_val_losses['loss_step']:.6f}")
     logging.info(f"   🖼️  VAE Recon Loss: {avg_val_losses['loss_vae_recon']:.6f}")
     logging.info(f"   📊 VAE KL Loss: {avg_val_losses['loss_vae_kl']:.6f}")
     logging.info(f"   ⏱️  VAE Temporal Loss: {avg_val_losses['loss_vae_temporal']:.6f}")
@@ -438,8 +428,7 @@ def validate_epoch(
             'epoch_summary/val_loss_total': avg_val_losses['loss_total'],
             'epoch_summary/val_loss_velocity': avg_val_losses['loss_velocity'],
             'epoch_summary/val_loss_flf': avg_val_losses['loss_flf'],
-            'epoch_summary/val_loss_mid': avg_val_losses['loss_mid'],      # NEW
-            'epoch_summary/val_loss_tv': avg_val_losses['loss_tv'],      
+            'epoch_summary/val_loss_step': avg_val_losses['loss_step'],
             'epoch_summary/val_loss_vae_recon': avg_val_losses['loss_vae_recon'],
             'epoch_summary/val_loss_vae_kl': avg_val_losses['loss_vae_kl'],
             'epoch_summary/val_loss_vae_temporal': avg_val_losses['loss_vae_temporal'],
