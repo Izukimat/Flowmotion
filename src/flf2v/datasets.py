@@ -47,9 +47,13 @@ class LungCTDataset(Dataset):
         self.df = pd.read_csv(csv_file)
         self.df = self.df[self.df['split'] == split]
         
-        # Apply filters if specified (prefer exact 0-50% range when requested)
-        if phase_filter:
-            self.df = self.df[self.df['phase_range'].astype(str).str.contains(str(phase_filter))]
+        # Apply filters if specified (prefer 0-50% range when requested) with fallback
+        if phase_filter and 'phase_range' in self.df.columns:
+            df_filtered = self.df[self.df['phase_range'].astype(str).str.contains(str(phase_filter))]
+            if len(df_filtered) == 0:
+                logging.warning(f"Phase filter '{phase_filter}' returned 0 rows; using unfiltered split '{split}'.")
+            else:
+                self.df = df_filtered
         
         if experiment_filter:
             self.df = self.df[self.df['experiment_id'].isin(experiment_filter)]

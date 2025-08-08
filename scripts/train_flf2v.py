@@ -521,6 +521,11 @@ def main():
     
     logging.info(f"📚 Loaded {len(train_dataset)} train samples")
     logging.info(f"📚 Loaded {len(val_dataset)} val samples")
+    if len(train_dataset) == 0:
+        logging.error("No training samples found. Check --csv-file, phase_range filter, and data_root paths.")
+        return
+    if len(val_dataset) == 0:
+        logging.warning("No validation samples found. Continuing without validation.")
     
     # Create dataloaders
     train_sampler = DistributedSampler(train_dataset) if args.distributed else None
@@ -646,7 +651,7 @@ def main():
         
         # Validate with enhanced logging
         val_losses = {}
-        if epoch % config['training'].get('val_freq', 5) == 0:
+        if (len(val_dataset) > 0) and (epoch % config['training'].get('val_freq', 5) == 0):
             val_losses = validate_epoch(
                 model, val_loader, epoch, config, device, not args.no_wandb
             )
