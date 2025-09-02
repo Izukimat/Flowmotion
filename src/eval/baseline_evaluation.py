@@ -127,22 +127,16 @@ def setup_logging(verbose: bool):
         format="%(asctime)s | %(levelname)s | %(message)s"
     )
 
-def normalize_01(img: np.ndarray) -> np.ndarray:
+def normalize_stack_01(frames: np.ndarray) -> np.ndarray:
     """
-    Per-image baseline-like normalization to [0,1].
-    If already [0,1], pass-through.
-    Else use percentile [1,99].
+    Stack-level percentile [1,99] normalization to [0,1] shared across all frames.
     """
-    img = img.astype(np.float32, copy=False)
-    amin, amax = float(img.min()), float(img.max())
-    if amin >= -1e-3 and amax <= 1.0 + 1e-3:
-        return np.clip(img, 0.0, 1.0)
-    lo, hi = np.percentile(img, 1), np.percentile(img, 99)
-    if hi > lo:
-        x = (img - lo) / (hi - lo)
-    else:
-        x = np.zeros_like(img)
-    return np.clip(x, 0.0, 1.0)
+    f = frames.astype(np.float32, copy=False)
+    lo, hi = np.percentile(f, 1), np.percentile(f, 99)
+    if hi <= lo:
+        return np.zeros_like(f, dtype=np.float32)
+    x = (f - lo) / (hi - lo)
+    return np.clip(x, 0.0, 1.0).astype(np.float32, copy=False)
 
 def psnr_ssim(pred01: np.ndarray, ref01: np.ndarray, use_gaussian_ssim: bool = True) -> Tuple[float, float]:
     p = float(sk_psnr(ref01, pred01, data_range=1.0))
@@ -206,8 +200,7 @@ def load_split_patients(azure_root: Path, split: str) -> List[str]:
 def discover_samples(azure_root: Path, patients: List[str], slices: List[int]) -> List[Dict]:
     """
     Find (patient, series_id, slice_num, phase_dir).
-    We use the 'hfr_linear_8fps' tree to get GT input_frames.npy for simplicity,
-    since it contains identical input_frames.npy across experiment dirs.
+    We use any experiment dir that carries 'input_frames.npy' (linear/optflow trees both ok).
     """
     data_dir = azure_root / "data"
     out = []
@@ -247,7 +240,8 @@ def discover_samples(azure_root: Path, patients: List[str], slices: List[int]) -
 def load_gt_frames(phase_dir: str) -> Tuple[np.ndarray, Dict[int, int]]:
     """
     Load input_frames.npy and map phases -> indices.
-    Returns frames [10,H,W] in [0,1], and a dict phase->idx
+    Returns frames [10,H,W] in [0,1], and a dict phase->idx.
+    Uses stack-level normalization for fairness across methods.
     """
     inp = Path(phase_dir) / "input_frames.npy"
     meta = Path(phase_dir) / "metadata.json"
@@ -256,8 +250,7 @@ def load_gt_frames(phase_dir: str) -> Tuple[np.ndarray, Dict[int, int]]:
         md = json.load(f)
     input_phases = md.get("experiment", {}).get("input_phases", list(range(0, 100, 10)))
     ph2idx = {ph: i for i, ph in enumerate(input_phases)}
-    # normalize per-image to [0,1]
-    frames01 = np.stack([normalize_01(frames[i]) for i in range(frames.shape[0])], axis=0)
+    frames01 = normalize_stack_01(frames)  # <-- stack-level
     return frames01, ph2idx
 
 # -------------------- Baselines --------------------
@@ -282,7 +275,6 @@ class LinearBaseline(BaseBaseline):
 
 class SplineBaseline(BaseBaseline):
     name = "spline"
-    # simple cubic smoothstep in time between endpoints
     @staticmethod
     def _smoothstep(t: float) -> float:
         return t * t * (3 - 2 * t)
@@ -299,7 +291,7 @@ class OpticalFlowBaseline(BaseBaseline):
         self.cache_root = cache_root
 
     def synthesize(self, I0, I50, t_list):
-        # compute forward flow I0->I50 using Farneback on uint8
+        # Farnebäck on uint8; compute forward flow I0->I50
         H, W = I0.shape
         key = None
         flow = None
@@ -316,23 +308,28 @@ class OpticalFlowBaseline(BaseBaseline):
                 A, B, None,
                 pyr_scale=0.5, levels=3, winsize=15,
                 iterations=3, poly_n=5, poly_sigma=1.2, flags=0
-            )  # (H,W,2) float32 (dx, dy)
+            )  # (H,W,2) float32 forward (dx, dy)
             if key is not None:
                 np.save(str(key), flow)
 
-        # Warp I0 with t * flow using remap
+        # Backward sampling: sample I0 at (x - t*dx, y - t*dy)
         grid_x, grid_y = np.meshgrid(np.arange(W), np.arange(H))
         out = {}
         for t in t_list:
             dx = t * flow[..., 0]
             dy = t * flow[..., 1]
-            map_x = (grid_x + dx).astype(np.float32)
-            map_y = (grid_y + dy).astype(np.float32)
-            warped = cv2.remap(I0.astype(np.float32), map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            map_x = (grid_x - dx).astype(np.float32)  # NOTE: minus for backward mapping
+            map_y = (grid_y - dy).astype(np.float32)
+            warped = cv2.remap(I0.astype(np.float32), map_x, map_y,
+                               interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
             out[t] = self._ensure01(warped)
         return out
 
 class DIRBaseline(BaseBaseline):
+    """
+    Kept for completeness; not used if you run with --baselines linear,spline,optflow.
+    (Same as your current DIR; omitted here for brevity if desired.)
+    """
     name = "dir"
     def __init__(self, mesh_pixel: int = 32, iters: int = 200, metric: str = "mse", cache_root: Optional[Path] = None):
         self.mesh_px = int(mesh_pixel)
@@ -342,60 +339,116 @@ class DIRBaseline(BaseBaseline):
 
     def _register(self, I0: np.ndarray, I50: np.ndarray) -> sitk.Image:
         """
-        Register moving=I0 to fixed=I50 with BSpline, return displacement field (VectorFloat64) on I0 grid.
+        Register moving=I0 to fixed=I50 using a coarse-to-fine stack:
+        1) Rigid (Euler2D)  ->  2) Affine  ->  3) BSpline (order=3)
+        Returns a forward displacement field (VectorFloat64) on the I0 grid.
         """
-        H, W = I0.shape
+        # --- wrap numpy as SITK (2D) ---
         I0_s  = sitk.GetImageFromArray(I0.astype(np.float32))   # moving
         I50_s = sitk.GetImageFromArray(I50.astype(np.float32))  # fixed
-
-        # consistent geometry
         for im in (I0_s, I50_s):
             im.SetOrigin((0.0, 0.0))
             im.SetSpacing((1.0, 1.0))
             im.SetDirection((1.0, 0.0, 0.0, 1.0))
 
-        # BSpline transform domain (use fixed image domain is common)
-        mesh_size = [max(1, W // self.mesh_px), max(1, H // self.mesh_px)]
-        tx = sitk.BSplineTransformInitializer(image1=I50_s, transformDomainMeshSize=mesh_size, order=3)
+        # --- tiny helper: metric selection ---
+        def _set_metric(reg: sitk.ImageRegistrationMethod):
+            if self.metric == "mse":
+                reg.SetMetricAsMeanSquares()
+            else:
+                # MI is more tolerant to local intensity / HU changes
+                reg.SetMetricAsMattesMutualInformation(32)
 
+        # --- optional body masks to reduce background dominance (robust, best-effort) ---
+        fixed_mask = moving_mask = None
+        try:
+            # simple threshold + closing; tuned for normalized [0,1]
+            thr = 0.02
+            fm = sitk.BinaryMorphologicalClosing(sitk.Cast(I50_s > thr, sitk.sitkUInt8), 2)
+            mm = sitk.BinaryMorphologicalClosing(sitk.Cast(I0_s  > thr, sitk.sitkUInt8), 2)
+            fixed_mask, moving_mask = fm, mm
+        except Exception:
+            pass  # masks are optional
+
+        # --- Stage 1: Rigid (Euler2D) ---
+        rigid_init = sitk.CenteredTransformInitializer(
+            I50_s, I0_s,
+            sitk.Euler2DTransform(),
+            sitk.CenteredTransformInitializerFilter.GEOMETRY
+        )
         reg = sitk.ImageRegistrationMethod()
-        if self.metric == "mse":
-            reg.SetMetricAsMeanSquares()
-        else:
-            reg.SetMetricAsMattesMutualInformation(32)
-
+        _set_metric(reg)
         reg.SetInterpolator(sitk.sitkLinear)
-        reg.SetOptimizerAsGradientDescent(learningRate=1.0, numberOfIterations=self.iters,
-                                          convergenceMinimumValue=1e-6, convergenceWindowSize=10)
+        reg.SetShrinkFactorsPerLevel([4, 2, 1])
+        reg.SetSmoothingSigmasPerLevel([2.0, 1.0, 0.0])
+        reg.SetOptimizerAsGradientDescent(learningRate=1.0, numberOfIterations=200,
+                                        convergenceMinimumValue=1e-6, convergenceWindowSize=10)
         reg.SetOptimizerScalesFromPhysicalShift()
-        reg.SetShrinkFactorsPerLevel([2, 1])
-        reg.SetSmoothingSigmasPerLevel([1.0, 0.0])
+        if fixed_mask is not None:  reg.SetMetricFixedMask(fixed_mask)
+        if moving_mask is not None: reg.SetMetricMovingMask(moving_mask)
+        reg.SetInitialTransform(rigid_init, inPlace=False)
+        rigid_tx = reg.Execute(I50_s, I0_s)  # fixed, moving
 
-        # IMPORTANT: set initial transform, then Execute with TWO args: (fixed, moving)
-        reg.SetInitialTransform(tx, inPlace=False)
-        final_tx = reg.Execute(I50_s, I0_s)  # fixed=I50, moving=I0
+        # --- Stage 2: Affine (initialized with rigid as moving-initial) ---
+        affine_init = sitk.AffineTransform(2)
+        reg = sitk.ImageRegistrationMethod()
+        _set_metric(reg)
+        reg.SetInterpolator(sitk.sitkLinear)
+        reg.SetShrinkFactorsPerLevel([4, 2, 1])
+        reg.SetSmoothingSigmasPerLevel([2.0, 1.0, 0.0])
+        reg.SetOptimizerAsGradientDescent(learningRate=1.0, numberOfIterations=200,
+                                        convergenceMinimumValue=1e-6, convergenceWindowSize=10)
+        reg.SetOptimizerScalesFromPhysicalShift()
+        if fixed_mask is not None:  reg.SetMetricFixedMask(fixed_mask)
+        if moving_mask is not None: reg.SetMetricMovingMask(moving_mask)
+        reg.SetInitialTransform(affine_init, inPlace=False)
+        reg.SetMovingInitialTransform(rigid_tx)  # chain: rigid -> affine
+        affine_tx = reg.Execute(I50_s, I0_s)
 
-        # Create displacement field on the I0 grid (moving image) — robust across SITK versions
+        # --- Stage 3: BSpline deformable (initialized on fixed domain), chained after affine ---
+        mesh_size = [max(1, I50_s.GetSize()[0] // self.mesh_px),
+                    max(1, I50_s.GetSize()[1] // self.mesh_px)]
+        bspline_init = sitk.BSplineTransformInitializer(image1=I50_s,
+                                                        transformDomainMeshSize=mesh_size,
+                                                        order=3)
+        reg = sitk.ImageRegistrationMethod()
+        _set_metric(reg)
+        reg.SetInterpolator(sitk.sitkLinear)
+        reg.SetShrinkFactorsPerLevel([4, 2, 1])
+        reg.SetSmoothingSigmasPerLevel([2.0, 1.0, 0.0])
+        # allow more iterations for deformable stage
+        reg.SetOptimizerAsGradientDescent(learningRate=1.0, numberOfIterations=max(self.iters, 300),
+                                        convergenceMinimumValue=1e-6, convergenceWindowSize=10)
+        reg.SetOptimizerScalesFromPhysicalShift()
+        if fixed_mask is not None:  reg.SetMetricFixedMask(fixed_mask)
+        if moving_mask is not None: reg.SetMetricMovingMask(moving_mask)
+        reg.SetInitialTransform(bspline_init, inPlace=False)
+        reg.SetMovingInitialTransform(affine_tx)  # chain: rigid -> affine -> bspline (optimize bspline)
+        bspline_tx = reg.Execute(I50_s, I0_s)
+
+        # --- Compose full moving->fixed transform chain ---
+        comp = sitk.CompositeTransform(2)
+        comp.AddTransform(rigid_tx)
+        comp.AddTransform(affine_tx)
+        comp.AddTransform(bspline_tx)
+
+        # --- Convert to forward displacement on the I0 (moving) grid ---
         try:
             df = sitk.TransformToDisplacementFieldFilter()
             df.SetReferenceImage(I0_s)
             df.SetOutputPixelType(sitk.sitkVectorFloat64)
-            disp = df.Execute(final_tx)
+            disp = df.Execute(comp)  # forward field: I0 -> I50
         except Exception:
-            # Fallbacks in case the filter API isn't available in your build
             try:
-                disp = sitk.TransformToDisplacementField(final_tx, sitk.sitkVectorFloat64, I0_s)
+                disp = sitk.TransformToDisplacementField(comp, sitk.sitkVectorFloat64, I0_s)
             except Exception:
                 disp = sitk.TransformToDisplacementField(
-                    final_tx,
-                    I0_s.GetSize(),
-                    I0_s.GetOrigin(),
-                    I0_s.GetSpacing(),
-                    I0_s.GetDirection(),
-                    sitk.sitkVectorFloat64,
+                    comp,
+                    I0_s.GetSize(), I0_s.GetOrigin(), I0_s.GetSpacing(), I0_s.GetDirection(),
+                    sitk.sitkVectorFloat64
                 )
-
         return disp
+
 
     def synthesize(self, I0, I50, t_list):
         disp = None
@@ -420,7 +473,7 @@ class DIRBaseline(BaseBaseline):
         for t in t_list:
             # Resample expects a transform that maps OUTPUT -> INPUT.
             # Our displacement field is forward (I0 -> I50), so we use the NEGATIVE field for backward sampling.
-            scaled_np = -(float(t) * disp_np)  # note the minus sign
+            scaled_np = -(float(t) * disp_np)
             disp_t = sitk.GetImageFromArray(scaled_np.astype(np.float64), isVector=True)
             disp_t.CopyInformation(disp)
 
