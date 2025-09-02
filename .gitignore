@@ -18,7 +18,6 @@ notebooks/.ipynb_checkpoints/
 .idea/
 
 # Data
-*.csv
 *.npz
 *.npy
 *.pt
