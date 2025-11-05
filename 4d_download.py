@@ -14,9 +14,9 @@ import json
 
 # Configuration
 COLLECTION = "4D-Lung"
-DATA_DIR = Path("/mnt/tcia_data/raw") / COLLECTION
+DATA_DIR = Path("data/4D-Lung/raw") / COLLECTION
 LOG_FILE = Path("download_log.json")
-MAX_PATIENTS = 20  # Start with 3 patients for testing
+MAX_PATIENTS = 1  # Start with 3 patients for testing
 
 # Initialize
 DATA_DIR.mkdir(parents=True, exist_ok=True)
